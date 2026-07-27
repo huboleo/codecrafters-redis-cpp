@@ -28,6 +28,8 @@ class Database {
     [[nodiscard]] std::optional<std::vector<std::string>>
     list_elements(const std::string& key, std::int64_t start, std::int64_t stop);
 
+    [[nodiscard]] std::size_t get_list_length(const std::string& key);
+
   private:
     using Clock = std::chrono::steady_clock;
 

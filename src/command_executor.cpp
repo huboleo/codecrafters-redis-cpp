@@ -143,5 +143,15 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return resp::Array{.values = std::move(*values)};
     }
 
+    if (command[0] == "LLEN") {
+        if (command.size() != 2) {
+            return resp::SimpleError{.value =
+                                         "ERR invalid syntax. Expected usage LLEN <list_name>"};
+        }
+
+        auto size = _database.get_list_length(command[1]);
+        return resp::Integer{.value = static_cast<std::int64_t>(size)};
+    }
+
     return resp::SimpleError{.value = "ERR unknown command"};
 }

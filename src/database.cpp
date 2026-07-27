@@ -102,3 +102,14 @@ Database::list_elements(const std::string& key, std::int64_t start, std::int64_t
 
     return std::vector<std::string>(list.begin() + start, list.begin() + stop + 1);
 }
+
+std::size_t Database::get_list_length(const std::string& key) {
+    std::lock_guard lock(_mutex);
+    auto entry = _lists.find(key);
+
+    if (entry == _lists.end()) {
+        return 0;
+    }
+
+    return entry->second.size();
+}
