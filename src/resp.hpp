@@ -1,26 +1,54 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <string>
-#include <utility>
+#include <string_view>
+#include <variant>
+#include <vector>
 
 namespace resp {
-enum class RespDataType {
-    SIMPLE_STRING,
-    SIMPLE_ERROR,
-    INTEGER,
-    BULK_STRING,
-    NULL_BULK_STRING,
-    ARRAY,
-    NULL_TYPE,
-    BOOLEAN,
-    DOUBLE,
-    BIG_NUMBER,
-    BULK_ERROR,
-    VERBATIM_STRING,
-    MAP,
-    ATTRIBUTE,
-    SET,
-    PUSH
+
+// Parsing
+using Command = std::vector<std::string>;
+struct ParseResult {
+    Command command;
+    std::size_t bytes_consumed;
 };
 
-std::string serialize_string_response(RespDataType type, std::string response);
+enum class ParseErrorCode {
+    INVALID_FORMAT,
+    INVALID_LENGTH,
+};
+
+struct ParseError {
+    ParseErrorCode code;
+    std::string message;
+};
+
+struct Incomplete {};
+
+using ParseOutcome = std::variant<ParseResult, Incomplete, ParseError>;
+
+[[nodiscard]] ParseOutcome parse_command(std::string_view input);
+
+// Serializing Response
+
+struct SimpleString {
+    std::string value;
+};
+struct SimpleError {
+    std::string value;
+};
+struct BulkString {
+    std::string value;
+};
+struct Integer {
+    std::int64_t value;
+};
+struct Null {};
+
+using Response = std::variant<SimpleString, SimpleError, BulkString, Integer, Null>;
+
+std::string serialize_response(Response response);
+
 } // namespace resp

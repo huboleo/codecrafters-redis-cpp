@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
     }
 
     // Runs the connection accept loop
-    server.accept_connections();
+    server.run();
 
     return 0;
 }

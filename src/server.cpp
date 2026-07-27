@@ -5,11 +5,12 @@
 #include <cstring>
 #include <expected>
 #include <netdb.h>
-#include <print>
 #include <string>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <thread>
 #include <unistd.h>
+#include <variant>
 
 TcpServer::~TcpServer() {
     if (_server_fd >= 0) {
@@ -48,22 +49,57 @@ std::expected<void, std::string> TcpServer::setup_server() {
     return {};
 }
 
-void TcpServer::accept_connections() {
+void TcpServer::handle_connection(int client_fd) {
+    std::string input_buffer;
+    char receive_buffer[1024];
+    while (true) {
+        ssize_t bytes_read = recv(client_fd, receive_buffer, sizeof(receive_buffer), 0);
+
+        if (bytes_read <= 0) {
+            break;
+        }
+
+        input_buffer.append(receive_buffer, static_cast<std::size_t>(bytes_read));
+
+        while (!input_buffer.empty()) {
+            auto outcome = resp::parse_command(input_buffer);
+
+            if (std::holds_alternative<resp::Incomplete>(outcome)) {
+                break;
+            }
+
+            if (auto* error = std::get_if<resp::ParseError>(&outcome)) {
+                close(client_fd);
+                return;
+            }
+
+            auto& result = std::get<resp::ParseResult>(outcome);
+
+            auto execution_result = _executor.execute(result.command);
+
+            auto serialized_response = resp::serialize_response(std::move(execution_result));
+
+            send(client_fd, serialized_response.data(), serialized_response.size(), 0);
+
+            input_buffer.erase(0, result.bytes_consumed);
+        }
+    }
+
+    close(client_fd);
+}
+
+void TcpServer::run() {
     while (true) {
         struct sockaddr_in client_addr;
         int client_addr_len = sizeof(client_addr);
-        std::println("Waiting for a client to connect...");
 
         int client_socket_fd =
             accept(_server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addr_len);
+
         if (client_socket_fd < 0) {
             continue;
         }
 
-        std::println("Client connected");
-
-        auto response = resp::serialize_string_response(resp::RespDataType::SIMPLE_STRING, "PONG");
-
-        send(client_socket_fd, response.c_str(), response.size(), 0);
+        std::thread(&TcpServer::handle_connection, this, client_socket_fd).detach();
     }
 }
