@@ -2,6 +2,7 @@
 #include "resp.hpp"
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <system_error>
 
@@ -82,6 +83,16 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         }
 
         return resp::BulkString{.value = std::move(*value)};
+    }
+
+    if (command[0] == "RPUSH") {
+        if (command.size() < 3) {
+            return resp::SimpleError{
+                .value = "ERR invalid syntax. Expected usage RPUSH <list_name> <values...>"};
+        }
+        std::vector<std::string> values(command.begin() + 2, command.end());
+        auto size = _database.append_list_elements(command[1], std::move(values));
+        return resp::Integer{.value = static_cast<int64_t>(size)};
     }
 
     return resp::SimpleError{.value = "ERR unknown command"};
