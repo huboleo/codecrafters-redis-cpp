@@ -1,5 +1,22 @@
 #include "command_executor.hpp"
 #include "resp.hpp"
+#include <charconv>
+#include <chrono>
+#include <optional>
+#include <system_error>
+
+namespace {
+std::optional<std::chrono::milliseconds::rep> get_expiration_count(const std::string& text) {
+    std::chrono::milliseconds::rep count{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
+
+    if (error != std::errc{} or end != text.data() + text.size() or count <= 0) {
+        return std::nullopt;
+    }
+
+    return count;
+}
+} // namespace
 
 resp::Response CommandExecutor::execute(const resp::Command& command) {
     if (command.empty()) {
@@ -19,6 +36,52 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         }
 
         return resp::BulkString{.value = command[1]};
+    }
+
+    if (command[0] == "SET") {
+        if (command.size() == 3) {
+            _database.set(command[1], command[2], std::nullopt);
+            return resp::SimpleString{.value = "OK"};
+        }
+        if (command.size() == 5) {
+
+            auto parsed_expiration = get_expiration_count(command[4]);
+
+            if (!parsed_expiration) {
+                return resp::SimpleError{.value = "ERR invalid expire time in set command"};
+            }
+
+            std::chrono::milliseconds expiry;
+
+            if (command[3] == "PX") {
+                expiry = std::chrono::milliseconds{*parsed_expiration};
+            } else if (command[3] == "EX") {
+                expiry = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::seconds{*parsed_expiration});
+            } else {
+                return resp::SimpleError{.value = "ERR syntax error"};
+            }
+
+            _database.set(command[1], command[2], expiry);
+            return resp::SimpleString{.value = "OK"};
+        }
+
+        return resp::SimpleError{
+            .value = "ERR invalid syntax. Expected usage SET <key> <value> <EX/PX> <time>"};
+    }
+
+    if (command[0] == "GET") {
+        if (command.size() != 2) {
+            return resp::SimpleError{.value = "ERR invalid syntax. Expected usage GET <key>"};
+        }
+
+        auto value = _database.get(command[1]);
+
+        if (!value) {
+            return resp::Null{};
+        }
+
+        return resp::BulkString{.value = std::move(*value)};
     }
 
     return resp::SimpleError{.value = "ERR unknown command"};

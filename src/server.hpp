@@ -15,6 +15,6 @@ class TcpServer {
 
   private:
     int _server_fd = -1;
-    CommandExecutor _executor{};
+    CommandExecutor _executor;
     void handle_connection(int client_fd);
 };
