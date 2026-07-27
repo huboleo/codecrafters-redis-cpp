@@ -19,6 +19,10 @@ class Database {
     [[nodiscard]] std::size_t append_list_elements(std::string key,
                                                    std::vector<std::string> values);
 
+    // stop is inclusive
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    list_elements(const std::string& key, std::int64_t start, std::int64_t stop);
+
   private:
     using Clock = std::chrono::steady_clock;
 

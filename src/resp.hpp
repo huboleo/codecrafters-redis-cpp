@@ -46,8 +46,13 @@ struct Integer {
     std::int64_t value;
 };
 struct Null {};
+struct EmptyArray {};
+struct Array {
+    std::vector<std::string> values;
+};
 
-using Response = std::variant<SimpleString, SimpleError, BulkString, Integer, Null>;
+using Response =
+    std::variant<SimpleString, SimpleError, BulkString, Integer, Null, EmptyArray, Array>;
 
 std::string serialize_response(Response response);
 

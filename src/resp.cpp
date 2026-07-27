@@ -7,6 +7,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 namespace {
 std::optional<std::string_view> read_line(std::string_view input, std::size_t& position) {
@@ -155,6 +156,20 @@ std::string resp::serialize_response(Response response) {
 
     if (std::holds_alternative<Null>(response)) {
         return "$-1\r\n";
+    }
+
+    if (std::holds_alternative<EmptyArray>(response)) {
+        return "*0\r\n";
+    }
+
+    if (auto* array = std::get_if<Array>(&response)) {
+        std::string result = "*" + std::to_string(array->values.size()) + "\r\n";
+        for (const auto& value : array->values) {
+            result += "$" + std::to_string(value.size()) + "\r\n";
+            result += value;
+            result += "\r\n";
+        }
+        return result;
     }
 
     return {};
