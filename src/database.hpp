@@ -10,14 +10,19 @@
 
 class Database {
   public:
+    enum class ListAddMode {
+        APPEND,
+        PREPEND,
+    };
+
     using Milliseconds = std::chrono::milliseconds;
 
     void set(std::string key, std::string value, std::optional<Milliseconds> expiry);
 
     [[nodiscard]] std::optional<std::string> get(const std::string& key);
 
-    [[nodiscard]] std::size_t append_list_elements(std::string key,
-                                                   std::vector<std::string> values);
+    [[nodiscard]] std::size_t add_list_elements(std::string key, std::vector<std::string> values,
+                                                ListAddMode mode);
 
     // stop is inclusive
     [[nodiscard]] std::optional<std::vector<std::string>>

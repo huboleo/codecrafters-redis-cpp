@@ -41,7 +41,8 @@ std::optional<std::string> Database::get(const std::string& key) {
     return entry->second.value;
 }
 
-std::size_t Database::append_list_elements(std::string key, std::vector<std::string> values) {
+std::size_t Database::add_list_elements(std::string key, std::vector<std::string> values,
+                                        ListAddMode mode) {
     std::lock_guard lock(_mutex);
 
     auto [entry, inserted] = _lists.try_emplace(std::move(key));
@@ -50,8 +51,13 @@ std::size_t Database::append_list_elements(std::string key, std::vector<std::str
 
     list.reserve(list.size() + values.size());
 
-    list.insert(list.end(), std::make_move_iterator(values.begin()),
-                std::make_move_iterator(values.end()));
+    if (mode == ListAddMode::APPEND) {
+        list.insert(list.end(), std::make_move_iterator(values.begin()),
+                    std::make_move_iterator(values.end()));
+    } else {
+        list.insert(list.begin(), std::make_move_iterator(values.rbegin()),
+                    std::make_move_iterator(values.rend()));
+    }
 
     return list.size();
 }

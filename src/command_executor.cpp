@@ -1,4 +1,5 @@
 #include "command_executor.hpp"
+#include "database.hpp"
 #include "resp.hpp"
 #include <charconv>
 #include <chrono>
@@ -103,7 +104,19 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
                 .value = "ERR invalid syntax. Expected usage RPUSH <list_name> <values...>"};
         }
         std::vector<std::string> values(command.begin() + 2, command.end());
-        auto size = _database.append_list_elements(command[1], std::move(values));
+        auto size = _database.add_list_elements(command[1], std::move(values),
+                                                Database::ListAddMode::APPEND);
+        return resp::Integer{.value = static_cast<int64_t>(size)};
+    }
+
+    if (command[0] == "LPUSH") {
+        if (command.size() < 3) {
+            return resp::SimpleError{
+                .value = "ERR invalid syntax. Expected usage LPUSH <list_name> <values...>"};
+        }
+        std::vector<std::string> values(command.begin() + 2, command.end());
+        auto size = _database.add_list_elements(command[1], std::move(values),
+                                                Database::ListAddMode::PREPEND);
         return resp::Integer{.value = static_cast<int64_t>(size)};
     }
 
