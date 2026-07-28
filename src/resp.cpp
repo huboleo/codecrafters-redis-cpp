@@ -28,7 +28,7 @@ std::expected<std::size_t, resp::ParseError> parse_length(std::string_view text)
 
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), length);
 
-    if (text.empty() or error != std::errc{} or end != text.data() + text.size()) {
+    if (text.empty() || error != std::errc{} || end != text.data() + text.size()) {
         return std::unexpected(resp::ParseError{.code = resp::ParseErrorCode::INVALID_LENGTH,
                                                 .message = "Invalid RESP length"});
     }
@@ -110,7 +110,7 @@ resp::ParseOutcome resp::parse_command(std::string_view input) {
             return Incomplete{};
         }
 
-        if (input[position] != '\r' or input[position + 1] != '\n') {
+        if (input[position] != '\r' || input[position + 1] != '\n') {
             return ParseError{.code = ParseErrorCode::INVALID_FORMAT,
                               .message = "Bulk string must end with CRLF"};
         }

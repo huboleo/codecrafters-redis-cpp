@@ -5,6 +5,7 @@
 #include "utils/time.hpp"
 #include <chrono>
 #include <optional>
+#include <utility>
 
 resp::Response CommandExecutor::execute(const resp::Command& command) {
     if (command.empty()) {
@@ -68,10 +69,36 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         auto value = _database.get(command[1]);
 
         if (!value) {
+            if (value.error() == Database::Error::WRONG_TYPE) {
+                return resp::SimpleError{
+                    .value =
+                        "WRONGTYPE Operation against a key holding the wrong kind of value"};
+            }
+
             return resp::NullBulkString{};
         }
 
         return resp::BulkString{.value = std::move(*value)};
+    }
+
+    if (cmd == "TYPE") {
+        if (command.size() != 2) {
+            return resp::SimpleError{
+                .value = "ERR invalid syntax. Expected usage TYPE <key>"};
+        }
+
+        switch (_database.get_type(command[1])) {
+        case Database::ValueType::NONE:
+            return resp::SimpleString{.value = "none"};
+
+        case Database::ValueType::STRING:
+            return resp::SimpleString{.value = "string"};
+
+        case Database::ValueType::LIST:
+            return resp::SimpleString{.value = "list"};
+        }
+
+        return resp::SimpleError{.value = "ERR unsupported value type"};
     }
 
     if (cmd == "RPUSH") {

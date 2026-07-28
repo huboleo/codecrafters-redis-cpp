@@ -5,17 +5,27 @@
 #include "utils/time.hpp"
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
+resp::SimpleError wrong_type_error() {
+    return resp::SimpleError{
+        .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
+}
+
 std::optional<std::int64_t> get_range_index(const std::string& text) {
     std::int64_t index{};
 
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), index);
 
-    if (error != std::errc{} or end != text.data() + text.size()) {
+    if (error != std::errc{} || end != text.data() + text.size()) {
         return std::nullopt;
     }
 
@@ -27,7 +37,7 @@ std::expected<int, resp::SimpleError> parse_number_of_elements(std::string_view 
 
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
 
-    if (text.empty() or error != std::errc{} or end != text.data() + text.size() or count <= 0) {
+    if (text.empty() || error != std::errc{} || end != text.data() + text.size() || count <= 0) {
         return std::unexpected(resp::SimpleError{.value = "ERR Invalid number of items format"});
     }
 
@@ -44,7 +54,12 @@ resp::Response rlist::rpush(Database& database, const resp::Command& command) {
     std::vector<std::string> values(command.begin() + 2, command.end());
     auto size =
         database.add_list_elements(command[1], std::move(values), Database::ListAddMode::APPEND);
-    return resp::Integer{.value = static_cast<int64_t>(size)};
+
+    if (!size) {
+        return wrong_type_error();
+    }
+
+    return resp::Integer{.value = static_cast<std::int64_t>(*size)};
 }
 
 resp::Response rlist::lpush(Database& database, const resp::Command& command) {
@@ -55,7 +70,12 @@ resp::Response rlist::lpush(Database& database, const resp::Command& command) {
     std::vector<std::string> values(command.begin() + 2, command.end());
     auto size =
         database.add_list_elements(command[1], std::move(values), Database::ListAddMode::PREPEND);
-    return resp::Integer{.value = static_cast<int64_t>(size)};
+
+    if (!size) {
+        return wrong_type_error();
+    }
+
+    return resp::Integer{.value = static_cast<std::int64_t>(*size)};
 }
 
 resp::Response rlist::lrange(Database& database, const resp::Command& command) {
@@ -68,13 +88,17 @@ resp::Response rlist::lrange(Database& database, const resp::Command& command) {
     auto start_index = get_range_index(command[2]);
     auto stop_index = get_range_index(command[3]);
 
-    if (!start_index or !stop_index) {
+    if (!start_index || !stop_index) {
         return resp::SimpleError{.value = "ERR invalid index value"};
     }
 
     auto values = database.list_elements(command[1], *start_index, *stop_index);
 
     if (!values) {
+        return wrong_type_error();
+    }
+
+    if (values->empty()) {
         return resp::EmptyArray{};
     }
 
@@ -87,11 +111,16 @@ resp::Response rlist::llen(Database& database, const resp::Command& command) {
     }
 
     auto size = database.get_list_length(command[1]);
-    return resp::Integer{.value = static_cast<std::int64_t>(size)};
+
+    if (!size) {
+        return wrong_type_error();
+    }
+
+    return resp::Integer{.value = static_cast<std::int64_t>(*size)};
 }
 
 resp::Response rlist::lpop(Database& database, const resp::Command& command) {
-    if (command.size() != 2 and command.size() != 3) {
+    if (command.size() != 2 && command.size() != 3) {
         return resp::SimpleError{
             .value = "ERR invalid syntax. Expected usage LPOP <list_name> <number_of_items?>"};
     }
@@ -100,10 +129,14 @@ resp::Response rlist::lpop(Database& database, const resp::Command& command) {
         auto result = database.pop_list_element(command[1]);
 
         if (!result) {
+            if (result.error() == Database::Error::WRONG_TYPE) {
+                return wrong_type_error();
+            }
+
             return resp::NullBulkString{};
         }
 
-        return resp::BulkString{.value = *result};
+        return resp::BulkString{.value = std::move(*result)};
     }
 
     auto parsed_number = parse_number_of_elements(command[2]);
@@ -115,10 +148,14 @@ resp::Response rlist::lpop(Database& database, const resp::Command& command) {
     auto result = database.pop_list_elements(command[1], *parsed_number);
 
     if (!result) {
+        if (result.error() == Database::Error::WRONG_TYPE) {
+            return wrong_type_error();
+        }
+
         return resp::NullBulkString{};
     }
 
-    return resp::Array{.values = *result};
+    return resp::Array{.values = std::move(*result)};
 }
 
 resp::Response rlist::blpop(Database& database, const resp::Command& command) {
@@ -133,17 +170,22 @@ resp::Response rlist::blpop(Database& database, const resp::Command& command) {
         return resp::SimpleError{.value = "ERR Invalid timeout value"};
     }
 
-    std::optional<Database::Milliseconds> timeout;
+    std::optional<std::chrono::milliseconds> timeout;
 
     if (*parsed_timeout > 0) {
         const auto fractional_seconds = std::chrono::duration<double>{*parsed_timeout};
 
-        timeout = std::chrono::duration_cast<Database::Milliseconds>(fractional_seconds);
+        timeout =
+            std::chrono::duration_cast<std::chrono::milliseconds>(fractional_seconds);
     }
 
     auto result = database.pop_list_element_blocking(command[1], timeout);
 
     if (!result) {
+        if (result.error() == Database::Error::WRONG_TYPE) {
+            return wrong_type_error();
+        }
+
         return resp::NullArray{};
     }
 
