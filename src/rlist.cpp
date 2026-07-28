@@ -136,8 +136,9 @@ resp::Response rlist::blpop(Database& database, const resp::Command& command) {
     std::optional<Database::Milliseconds> timeout;
 
     if (*parsed_timeout > 0) {
-        timeout = std::chrono::duration_cast<Database::Milliseconds>(
-            std::chrono::seconds{*parsed_timeout});
+        const auto fractional_seconds = std::chrono::duration<double>{*parsed_timeout};
+
+        timeout = std::chrono::duration_cast<Database::Milliseconds>(fractional_seconds);
     }
 
     auto result = database.pop_list_element_blocking(command[1], timeout);

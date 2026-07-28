@@ -1,6 +1,7 @@
 #include "time.hpp"
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <optional>
 #include <string>
 
@@ -15,14 +16,16 @@ std::optional<std::chrono::milliseconds::rep> time_utils::parse_expiry(const std
     return count;
 }
 
-std::optional<std::chrono::seconds::rep>
-time_utils::parse_blocking_timeout(const std::string& text) {
-    std::chrono::seconds::rep count{};
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
+std::optional<double> time_utils::parse_blocking_timeout(const std::string& text) {
+    double seconds{};
 
-    if (error != std::errc{} or end != text.data() + text.size() or count < 0) {
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), seconds,
+                                              std::chars_format::general);
+
+    if (text.empty() or error != std::errc{} or end != text.data() + text.size() or
+        !std::isfinite(seconds) or seconds < 0.0) {
         return std::nullopt;
     }
 
-    return count;
+    return seconds;
 }
