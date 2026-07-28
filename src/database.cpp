@@ -43,21 +43,28 @@ std::optional<std::string> Database::get(const std::string& key) {
 
 std::size_t Database::add_list_elements(std::string key, std::vector<std::string> values,
                                         ListAddMode mode) {
-    std::lock_guard lock(_mutex);
+    std::size_t result_size;
+    {
+        std::lock_guard lock(_mutex);
 
-    auto [entry, inserted] = _lists.try_emplace(std::move(key));
+        auto [entry, inserted] = _lists.try_emplace(std::move(key));
 
-    auto& list = entry->second;
+        auto& list = entry->second;
 
-    if (mode == ListAddMode::APPEND) {
-        list.insert(list.end(), std::make_move_iterator(values.begin()),
-                    std::make_move_iterator(values.end()));
-    } else {
-        list.insert(list.begin(), std::make_move_iterator(values.rbegin()),
-                    std::make_move_iterator(values.rend()));
+        if (mode == ListAddMode::APPEND) {
+            list.insert(list.end(), std::make_move_iterator(values.begin()),
+                        std::make_move_iterator(values.end()));
+        } else {
+            list.insert(list.begin(), std::make_move_iterator(values.rbegin()),
+                        std::make_move_iterator(values.rend()));
+        }
+
+        result_size = list.size();
     }
 
-    return list.size();
+    _list_changed.notify_all();
+
+    return result_size;
 }
 
 std::optional<std::vector<std::string>>
@@ -161,4 +168,33 @@ std::optional<std::vector<std::string>> Database::pop_list_elements(const std::s
     }
 
     return result;
+}
+
+std::optional<std::string>
+Database::pop_list_element_blocking(const std::string& key, std::optional<Milliseconds> timeout) {
+    std::unique_lock lock(_mutex);
+
+    auto has_element = [this, &key] {
+        auto entry = _lists.find(key);
+
+        return entry != _lists.end() and !entry->second.empty();
+    };
+
+    if (timeout) {
+        const bool became_ready = _list_changed.wait_for(lock, *timeout, has_element);
+
+        if (!became_ready) {
+            return std::nullopt;
+        }
+    } else {
+        _list_changed.wait(lock, has_element);
+    }
+
+    auto entry = _lists.find(key);
+    auto& list = entry->second;
+
+    std::string value = std::move(list.front());
+    list.pop_front();
+
+    return value;
 }

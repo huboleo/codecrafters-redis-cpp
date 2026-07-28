@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -36,6 +37,9 @@ class Database {
     [[nodiscard]] std::optional<std::vector<std::string>> pop_list_elements(const std::string& key,
                                                                             int number_of_items);
 
+    [[nodiscard]] std::optional<std::string>
+    pop_list_element_blocking(const std::string& key, std::optional<Milliseconds> timeout);
+
   private:
     using Clock = std::chrono::steady_clock;
 
@@ -47,4 +51,5 @@ class Database {
     std::unordered_map<std::string, Entry> _entries;
     std::unordered_map<std::string, std::deque<std::string>> _lists;
     std::mutex _mutex;
+    std::condition_variable _list_changed;
 };

@@ -45,14 +45,15 @@ struct BulkString {
 struct Integer {
     std::int64_t value;
 };
-struct Null {};
+struct NullBulkString {};
+struct NullArray {};
 struct EmptyArray {};
 struct Array {
     std::vector<std::string> values;
 };
 
-using Response =
-    std::variant<SimpleString, SimpleError, BulkString, Integer, Null, EmptyArray, Array>;
+using Response = std::variant<SimpleString, SimpleError, BulkString, Integer, NullBulkString,
+                              NullArray, EmptyArray, Array>;
 
 std::string serialize_response(Response response);
 

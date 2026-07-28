@@ -4,6 +4,7 @@
 #include "resp.hpp"
 
 namespace rlist {
+
 [[nodiscard]]
 resp::Response rpush(Database& database, const resp::Command& command);
 

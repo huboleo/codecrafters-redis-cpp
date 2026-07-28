@@ -154,8 +154,12 @@ std::string resp::serialize_response(Response response) {
         return ":" + std::to_string(integer->value) + "\r\n";
     }
 
-    if (std::holds_alternative<Null>(response)) {
+    if (std::holds_alternative<NullBulkString>(response)) {
         return "$-1\r\n";
+    }
+
+    if (std::holds_alternative<NullArray>(response)) {
+        return "*-1\r\n";
     }
 
     if (std::holds_alternative<EmptyArray>(response)) {

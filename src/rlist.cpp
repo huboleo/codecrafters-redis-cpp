@@ -2,7 +2,9 @@
 
 #include "database.hpp"
 #include "resp.hpp"
+#include "utils/time.hpp"
 #include <charconv>
+#include <chrono>
 #include <expected>
 #include <string>
 #include <vector>
@@ -98,7 +100,7 @@ resp::Response rlist::lpop(Database& database, const resp::Command& command) {
         auto result = database.pop_list_element(command[1]);
 
         if (!result) {
-            return resp::Null{};
+            return resp::NullBulkString{};
         }
 
         return resp::BulkString{.value = *result};
@@ -113,10 +115,36 @@ resp::Response rlist::lpop(Database& database, const resp::Command& command) {
     auto result = database.pop_list_elements(command[1], *parsed_number);
 
     if (!result) {
-        return resp::Null{};
+        return resp::NullBulkString{};
     }
 
     return resp::Array{.values = *result};
 }
 
-resp::Response rlist::blpop(Database& database, const resp::Command& command) {}
+resp::Response rlist::blpop(Database& database, const resp::Command& command) {
+    if (command.size() != 3) {
+        return resp::SimpleError{
+            .value = "ERR invalid syntax. Expected usage BLPOP <list_name> <timeout>"};
+    }
+
+    auto parsed_timeout = time_utils::parse_blocking_timeout(command[2]);
+
+    if (!parsed_timeout) {
+        return resp::SimpleError{.value = "ERR Invalid timeout value"};
+    }
+
+    std::optional<Database::Milliseconds> timeout;
+
+    if (*parsed_timeout > 0) {
+        timeout = std::chrono::duration_cast<Database::Milliseconds>(
+            std::chrono::seconds{*parsed_timeout});
+    }
+
+    auto result = database.pop_list_element_blocking(command[1], timeout);
+
+    if (!result) {
+        return resp::NullArray{};
+    }
+
+    return resp::Array{.values = {command[1], std::move(*result)}};
+}

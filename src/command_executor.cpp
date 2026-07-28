@@ -2,29 +2,13 @@
 #include "database.hpp"
 #include "resp.hpp"
 #include "rlist.hpp"
-#include <charconv>
+#include "utils/time.hpp"
 #include <chrono>
-#include <cstdint>
 #include <optional>
-#include <system_error>
-
-namespace {
-std::optional<std::chrono::milliseconds::rep> get_expiration_count(const std::string& text) {
-    std::chrono::milliseconds::rep count{};
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
-
-    if (error != std::errc{} or end != text.data() + text.size() or count <= 0) {
-        return std::nullopt;
-    }
-
-    return count;
-}
-
-} // namespace
 
 resp::Response CommandExecutor::execute(const resp::Command& command) {
     if (command.empty()) {
-        return resp::Null{};
+        return resp::NullBulkString{};
     }
 
     const auto& cmd = command[0];
@@ -51,7 +35,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         }
         if (command.size() == 5) {
 
-            auto parsed_expiration = get_expiration_count(command[4]);
+            auto parsed_expiration = time_utils::parse_expiry(command[4]);
 
             if (!parsed_expiration) {
                 return resp::SimpleError{.value = "ERR invalid expire time in set command"};
@@ -84,7 +68,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         auto value = _database.get(command[1]);
 
         if (!value) {
-            return resp::Null{};
+            return resp::NullBulkString{};
         }
 
         return resp::BulkString{.value = std::move(*value)};
@@ -110,9 +94,9 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return rlist::lpop(_database, command);
     }
 
-    // if (cmd == "BLPOP") {
-    //     return rlist::blpop(_database, command);
-    // }
+    if (cmd == "BLPOP") {
+        return rlist::blpop(_database, command);
+    }
 
     return resp::SimpleError{.value = "ERR unknown command"};
 }
