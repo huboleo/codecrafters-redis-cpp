@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -30,6 +31,11 @@ class Database {
 
     [[nodiscard]] std::size_t get_list_length(const std::string& key);
 
+    [[nodiscard]] std::optional<std::string> pop_list_element(const std::string& key);
+
+    [[nodiscard]] std::optional<std::vector<std::string>> pop_list_elements(const std::string& key,
+                                                                            int number_of_items);
+
   private:
     using Clock = std::chrono::steady_clock;
 
@@ -39,6 +45,6 @@ class Database {
     };
 
     std::unordered_map<std::string, Entry> _entries;
-    std::unordered_map<std::string, std::vector<std::string>> _lists;
+    std::unordered_map<std::string, std::deque<std::string>> _lists;
     std::mutex _mutex;
 };

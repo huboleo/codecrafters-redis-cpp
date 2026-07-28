@@ -1,6 +1,7 @@
 #include "command_executor.hpp"
 #include "database.hpp"
 #include "resp.hpp"
+#include "rlist.hpp"
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -19,17 +20,6 @@ std::optional<std::chrono::milliseconds::rep> get_expiration_count(const std::st
     return count;
 }
 
-std::optional<std::int64_t> get_range_index(const std::string& text) {
-    std::int64_t index{};
-
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), index);
-
-    if (error != std::errc{} or end != text.data() + text.size()) {
-        return std::nullopt;
-    }
-
-    return index;
-}
 } // namespace
 
 resp::Response CommandExecutor::execute(const resp::Command& command) {
@@ -37,13 +27,15 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return resp::Null{};
     }
 
-    if (command[0] == "PING") {
+    const auto& cmd = command[0];
+
+    if (cmd == "PING") {
         return resp::SimpleString{
             .value = "PONG",
         };
     }
 
-    if (command[0] == "ECHO") {
+    if (cmd == "ECHO") {
 
         if (command.size() != 2) {
             return resp::SimpleError{.value = "ERR expected format ECHO <text>"};
@@ -52,7 +44,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return resp::BulkString{.value = command[1]};
     }
 
-    if (command[0] == "SET") {
+    if (cmd == "SET") {
         if (command.size() == 3) {
             _database.set(command[1], command[2], std::nullopt);
             return resp::SimpleString{.value = "OK"};
@@ -84,7 +76,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
             .value = "ERR invalid syntax. Expected usage SET <key> <value> <EX/PX> <time>"};
     }
 
-    if (command[0] == "GET") {
+    if (cmd == "GET") {
         if (command.size() != 2) {
             return resp::SimpleError{.value = "ERR invalid syntax. Expected usage GET <key>"};
         }
@@ -98,60 +90,29 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return resp::BulkString{.value = std::move(*value)};
     }
 
-    if (command[0] == "RPUSH") {
-        if (command.size() < 3) {
-            return resp::SimpleError{
-                .value = "ERR invalid syntax. Expected usage RPUSH <list_name> <values...>"};
-        }
-        std::vector<std::string> values(command.begin() + 2, command.end());
-        auto size = _database.add_list_elements(command[1], std::move(values),
-                                                Database::ListAddMode::APPEND);
-        return resp::Integer{.value = static_cast<int64_t>(size)};
+    if (cmd == "RPUSH") {
+        return rlist::rpush(_database, command);
     }
 
-    if (command[0] == "LPUSH") {
-        if (command.size() < 3) {
-            return resp::SimpleError{
-                .value = "ERR invalid syntax. Expected usage LPUSH <list_name> <values...>"};
-        }
-        std::vector<std::string> values(command.begin() + 2, command.end());
-        auto size = _database.add_list_elements(command[1], std::move(values),
-                                                Database::ListAddMode::PREPEND);
-        return resp::Integer{.value = static_cast<int64_t>(size)};
+    if (cmd == "LPUSH") {
+        return rlist::lpush(_database, command);
     }
 
-    if (command[0] == "LRANGE") {
-        if (command.size() != 4) {
-            return resp::SimpleError{
-                .value = "ERR invalid syntax. Expected usage LRANGE <list_name> <start_index> "
-                         "<stop_index>"};
-        }
-
-        auto start_index = get_range_index(command[2]);
-        auto stop_index = get_range_index(command[3]);
-
-        if (!start_index or !stop_index) {
-            return resp::SimpleError{.value = "ERR invalid index value"};
-        }
-
-        auto values = _database.list_elements(command[1], *start_index, *stop_index);
-
-        if (!values) {
-            return resp::EmptyArray{};
-        }
-
-        return resp::Array{.values = std::move(*values)};
+    if (cmd == "LRANGE") {
+        return rlist::lrange(_database, command);
     }
 
-    if (command[0] == "LLEN") {
-        if (command.size() != 2) {
-            return resp::SimpleError{.value =
-                                         "ERR invalid syntax. Expected usage LLEN <list_name>"};
-        }
-
-        auto size = _database.get_list_length(command[1]);
-        return resp::Integer{.value = static_cast<std::int64_t>(size)};
+    if (cmd == "LLEN") {
+        return rlist::llen(_database, command);
     }
+
+    if (cmd == "LPOP") {
+        return rlist::lpop(_database, command);
+    }
+
+    // if (cmd == "BLPOP") {
+    //     return rlist::blpop(_database, command);
+    // }
 
     return resp::SimpleError{.value = "ERR unknown command"};
 }

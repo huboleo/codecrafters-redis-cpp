@@ -49,8 +49,6 @@ std::size_t Database::add_list_elements(std::string key, std::vector<std::string
 
     auto& list = entry->second;
 
-    list.reserve(list.size() + values.size());
-
     if (mode == ListAddMode::APPEND) {
         list.insert(list.end(), std::make_move_iterator(values.begin()),
                     std::make_move_iterator(values.end()));
@@ -112,4 +110,55 @@ std::size_t Database::get_list_length(const std::string& key) {
     }
 
     return entry->second.size();
+}
+
+std::optional<std::string> Database::pop_list_element(const std::string& key) {
+    std::lock_guard lock(_mutex);
+
+    auto entry = _lists.find(key);
+
+    if (entry == _lists.end()) {
+        return std::nullopt;
+    }
+
+    auto& list = entry->second;
+
+    if (list.empty()) {
+        return std::nullopt;
+    }
+
+    std::string deleted = std::move(list.front());
+    list.pop_front();
+
+    return deleted;
+}
+
+std::optional<std::vector<std::string>> Database::pop_list_elements(const std::string& key,
+                                                                    int number_of_items) {
+    std::lock_guard lock(_mutex);
+
+    auto entry = _lists.find(key);
+
+    if (entry == _lists.end()) {
+        return std::nullopt;
+    }
+
+    auto& list = entry->second;
+
+    if (list.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> result{};
+
+    if (number_of_items > list.size()) {
+        number_of_items = list.size();
+    }
+
+    for (std::size_t i{0}; i < number_of_items; ++i) {
+        result.push_back(std::move(list.front()));
+        list.pop_front();
+    }
+
+    return result;
 }
