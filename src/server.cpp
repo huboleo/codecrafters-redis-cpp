@@ -1,6 +1,7 @@
 #include "server.hpp"
 #include "resp.hpp"
 #include <arpa/inet.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
@@ -11,6 +12,8 @@
 #include <thread>
 #include <unistd.h>
 #include <variant>
+
+TcpServer::TcpServer(std::uint16_t port) : _port(port) {}
 
 TcpServer::~TcpServer() {
     if (_server_fd >= 0) {
@@ -33,7 +36,7 @@ std::expected<void, std::string> TcpServer::setup_server() {
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(6379);
+    server_addr.sin_port = htons(_port);
 
     if (bind(_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
         close(_server_fd);

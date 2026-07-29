@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -319,61 +320,92 @@ Database::add_stream(const std::string& key, rstream::IdRequest id,
     if (!stream) {
         return std::unexpected(Error::WRONG_TYPE);
     }
+    const bool has_entries = !stream->empty();
 
-    // Mode comes from rstream and its always valid
+    const StreamId last_id = has_entries ? stream->back().id : StreamId{};
+
+    StreamId new_stream_id{};
+
     switch (id.mode) {
-    case rstream::IdRequest::Mode::EXPLICIT: {
-        StreamId new_stream_id = {.milliseconds = id.milliseconds, .sequence = id.sequence};
-        if (stream->size() > 0) {
-            auto& last_id = stream->back().id;
+    case rstream::IdRequest::Mode::EXPLICIT:
+        new_stream_id = StreamId{
+            .milliseconds = id.milliseconds,
+            .sequence = id.sequence,
+        };
+        break;
 
-            if (new_stream_id <= last_id) {
-                return std::unexpected(Error::INVALID_STREAM_ID_VALUE);
-            }
-        }
-
-        stream->push_back(StreamEntry{.id = new_stream_id, .values = std::move(values)});
-        return new_stream_id;
-    }
     case rstream::IdRequest::Mode::AUTOMATIC_SEQUENCE: {
-        std::uint64_t sequence_num = 0;
-        if (id.milliseconds == 0) {
-            sequence_num = 1;
-        }
-        if (stream->size() > 0) {
-            auto& last_id = stream->back().id;
+        std::uint64_t sequence = id.milliseconds == 0 ? 1 : 0;
 
-            if (id.milliseconds == last_id.milliseconds) {
-                sequence_num = last_id.sequence + 1;
-            }
+        if (has_entries && id.milliseconds == last_id.milliseconds) {
+            sequence = last_id.sequence + 1;
         }
-        StreamId new_stream_id = {.milliseconds = id.milliseconds, .sequence = sequence_num};
-        stream->push_back(StreamEntry{.id = new_stream_id, .values = std::move(values)});
 
-        return new_stream_id;
+        new_stream_id = StreamId{
+            .milliseconds = id.milliseconds,
+            .sequence = sequence,
+        };
+
+        break;
     }
     case rstream::IdRequest::Mode::AUTOMATIC: {
         const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::system_clock::now().time_since_epoch())
                                       .count();
 
-        auto new_id_milliseconds = static_cast<std::uint64_t>(milliseconds);
+        const auto current_time = static_cast<std::uint64_t>(milliseconds);
 
-        std::uint64_t sequence_num = 0;
-        if (stream->size() > 0) {
-            auto& last_id = stream->back().id;
-
-            if (last_id.milliseconds == new_id_milliseconds) {
-                sequence_num = last_id.sequence + 1;
-            }
+        if (has_entries && current_time <= last_id.milliseconds) {
+            new_stream_id = StreamId{
+                .milliseconds = last_id.milliseconds,
+                .sequence = last_id.sequence + 1,
+            };
+        } else {
+            new_stream_id = StreamId{
+                .milliseconds = current_time,
+                .sequence = 0,
+            };
         }
 
-        StreamId new_stream_id = {.milliseconds = new_id_milliseconds, .sequence = sequence_num};
-        stream->push_back(StreamEntry{.id = new_stream_id, .values = std::move(values)});
-        return new_stream_id;
+        break;
     }
 
     default:
         return std::unexpected(Error::INVALID_STREAM_ID_MODE);
     }
+
+    if (has_entries && new_stream_id <= last_id) {
+        return std::unexpected(Error::INVALID_STREAM_ID_VALUE);
+    }
+
+    stream->push_back(StreamEntry{
+        .id = new_stream_id,
+        .values = std::move(values),
+    });
+
+    return new_stream_id;
+}
+
+std::expected<std::vector<Database::StreamEntry>, Database::Error>
+Database::stream_range(const std::string& key, StreamId start, StreamId end) {
+
+    std::lock_guard lock(_mutex);
+
+    Entry* entry = find_active_entry(key);
+
+    if (!entry) {
+        return std::unexpected(Database::Error::KEY_NOT_FOUND);
+    }
+
+    auto* stream = std::get_if<std::vector<StreamEntry>>(&entry->value);
+
+    if (!stream) {
+        return std::unexpected(Database::Error::WRONG_TYPE);
+    }
+
+    auto first = std::ranges::lower_bound(*stream, start, std::ranges::less{}, &StreamEntry::id);
+
+    auto last = std::ranges::upper_bound(*stream, end, std::ranges::less{}, &StreamEntry::id);
+
+    return std::vector<StreamEntry>(first, last);
 }

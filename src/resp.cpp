@@ -43,6 +43,33 @@ std::string serialize_line(char prefix, std::string value) {
 
     return value;
 }
+
+void append_bulk_string(std::string& output, const std::string& value) {
+    output += "$";
+    output += std::to_string(value.size());
+    output += "\r\n";
+    output += value;
+    output += "\r\n";
+}
+
+void append_nested_array(std::string& output,
+                         const std::vector<resp::ArrayElement>& values) {
+    output += "*";
+    output += std::to_string(values.size());
+    output += "\r\n";
+
+    for (const auto& element : values) {
+        if (const auto* value = std::get_if<std::string>(&element.value)) {
+            append_bulk_string(output, *value);
+            continue;
+        }
+
+        if (const auto* nested_values =
+                std::get_if<std::vector<resp::ArrayElement>>(&element.value)) {
+            append_nested_array(output, *nested_values);
+        }
+    }
+}
 } // namespace
 
 resp::ParseOutcome resp::parse_command(std::string_view input) {
@@ -169,10 +196,14 @@ std::string resp::serialize_response(Response response) {
     if (auto* array = std::get_if<Array>(&response)) {
         std::string result = "*" + std::to_string(array->values.size()) + "\r\n";
         for (const auto& value : array->values) {
-            result += "$" + std::to_string(value.size()) + "\r\n";
-            result += value;
-            result += "\r\n";
+            append_bulk_string(result, value);
         }
+        return result;
+    }
+
+    if (auto* nested_array = std::get_if<NestedArray>(&response)) {
+        std::string result;
+        append_nested_array(result, nested_array->values);
         return result;
     }
 

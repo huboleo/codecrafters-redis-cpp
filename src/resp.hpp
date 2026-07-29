@@ -52,8 +52,16 @@ struct Array {
     std::vector<std::string> values;
 };
 
+struct ArrayElement {
+    std::variant<std::string, std::vector<ArrayElement>> value;
+};
+
+struct NestedArray {
+    std::vector<ArrayElement> values;
+};
+
 using Response = std::variant<SimpleString, SimpleError, BulkString, Integer, NullBulkString,
-                              NullArray, EmptyArray, Array>;
+                              NullArray, EmptyArray, Array, NestedArray>;
 
 std::string serialize_response(Response response);
 

@@ -83,6 +83,9 @@ class Database {
     add_stream(const std::string& key, rstream::IdRequest id,
                std::vector<std::pair<std::string, std::string>> values);
 
+    [[nodiscard]] std::expected<std::vector<StreamEntry>, Error>
+    stream_range(const std::string& key, StreamId start, StreamId end);
+
   private:
     struct Entry {
         std::variant<std::string, std::deque<std::string>, std::vector<StreamEntry>> value;
