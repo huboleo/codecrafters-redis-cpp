@@ -2,6 +2,7 @@
 #include "database.hpp"
 #include "resp.hpp"
 #include "rlist.hpp"
+#include "rstream.hpp"
 #include "utils/time.hpp"
 #include <chrono>
 #include <optional>
@@ -71,8 +72,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         if (!value) {
             if (value.error() == Database::Error::WRONG_TYPE) {
                 return resp::SimpleError{
-                    .value =
-                        "WRONGTYPE Operation against a key holding the wrong kind of value"};
+                    .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
             }
 
             return resp::NullBulkString{};
@@ -83,8 +83,7 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
 
     if (cmd == "TYPE") {
         if (command.size() != 2) {
-            return resp::SimpleError{
-                .value = "ERR invalid syntax. Expected usage TYPE <key>"};
+            return resp::SimpleError{.value = "ERR invalid syntax. Expected usage TYPE <key>"};
         }
 
         switch (_database.get_type(command[1])) {
@@ -96,9 +95,12 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
 
         case Database::ValueType::LIST:
             return resp::SimpleString{.value = "list"};
-        }
 
-        return resp::SimpleError{.value = "ERR unsupported value type"};
+        case Database::ValueType::STREAM:
+            return resp::SimpleString{.value = "stream"};
+
+            return resp::SimpleError{.value = "ERR unsupported value type"};
+        }
     }
 
     if (cmd == "RPUSH") {
@@ -123,6 +125,10 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
 
     if (cmd == "BLPOP") {
         return rlist::blpop(_database, command);
+    }
+
+    if (cmd == "XADD") {
+        return rstream::xadd(_database, command);
     }
 
     return resp::SimpleError{.value = "ERR unknown command"};

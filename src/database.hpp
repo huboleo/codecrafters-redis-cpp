@@ -1,4 +1,5 @@
 #pragma once
+#include "rstream_types.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -20,19 +22,40 @@ class Database {
     };
 
     enum class Error {
+        // Generic errors
         KEY_NOT_FOUND,
         WRONG_TYPE,
         TIMEOUT,
+
+        // Stream specific error
+        INVALID_STREAM_ID_MODE,
+        INVALID_STREAM_ID_VALUE,
     };
 
     enum class ValueType {
         NONE,
         STRING,
         LIST,
+        STREAM,
     };
 
-    void set(std::string key, std::string value,
-             std::optional<std::chrono::milliseconds> expiry);
+    struct StreamId {
+        std::uint64_t milliseconds;
+        std::uint64_t sequence;
+
+        auto operator<=>(const StreamId&) const = default;
+
+        [[nodiscard]] std::string to_string() const {
+            return std::to_string(milliseconds) + "-" + std::to_string(sequence);
+        }
+    };
+
+    struct StreamEntry {
+        StreamId id;
+        std::vector<std::pair<std::string, std::string>> values;
+    };
+
+    void set(std::string key, std::string value, std::optional<std::chrono::milliseconds> expiry);
 
     [[nodiscard]] std::expected<std::string, Error> get(const std::string& key);
 
@@ -56,9 +79,13 @@ class Database {
     pop_list_element_blocking(const std::string& key,
                               std::optional<std::chrono::milliseconds> timeout);
 
+    [[nodiscard]] std::expected<StreamId, Error>
+    add_stream(const std::string& key, rstream::IdRequest id,
+               std::vector<std::pair<std::string, std::string>> values);
+
   private:
     struct Entry {
-        std::variant<std::string, std::deque<std::string>> value;
+        std::variant<std::string, std::deque<std::string>, std::vector<StreamEntry>> value;
         std::optional<std::chrono::steady_clock::time_point> expires_at;
     };
 
