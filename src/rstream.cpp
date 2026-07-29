@@ -85,6 +85,11 @@ resp::Response rstream::xadd(Database& database, const resp::Command& command) {
         return resp::SimpleError{.value = "ERR Invalid id format"};
     }
 
+    if (parsed_id->mode == IdRequest::Mode::EXPLICIT && parsed_id->milliseconds == 0 &&
+        parsed_id->sequence == 0) {
+        return resp::SimpleError{.value = "ERR The ID specified in XADD must be greater than 0-0"};
+    }
+
     auto parsed_values = parse_value_list(std::span<const std::string>{command}.subspan(3));
 
     if (!parsed_values) {
@@ -94,7 +99,15 @@ resp::Response rstream::xadd(Database& database, const resp::Command& command) {
     auto result = database.add_stream(command[1], *parsed_id, std::move(*parsed_values));
 
     if (!result) {
-        return resp::SimpleError{.value = "ERR during adding stream to the database"};
+        if (result.error() == Database::Error::WRONG_TYPE) {
+            return resp::SimpleError{
+                .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
+        }
+
+        if (result.error() == Database::Error::INVALID_STREAM_ID_VALUE) {
+            return resp::SimpleError{.value = "ERR The ID specified in XADD is equal or smaller "
+                                              "than the target stream top item"};
+        }
     }
 
     return resp::BulkString{.value = result->to_string()};
