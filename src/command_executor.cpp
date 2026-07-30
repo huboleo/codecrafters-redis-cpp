@@ -103,6 +103,27 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         }
     }
 
+    if (cmd == "INCR") {
+        if (command.size() != 2) {
+            return resp::SimpleError{.value = "ERR invalid syntax. Expected usage INCR <key>"};
+        }
+
+        auto result = _database.increment_key(command[1]);
+
+        if (!result) {
+            if (result.error() == Database::Error::WRONG_TYPE) {
+                return resp::SimpleError{
+                    .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
+            }
+
+            if (result.error() == Database::Error::VALUE_NOT_INTEGER) {
+                return resp::SimpleError{.value = "ERR value is not an integer or out of range"};
+            }
+        }
+
+        return resp::Integer{.value = *result};
+    }
+
     if (cmd == "RPUSH") {
         return rlist::rpush(_database, command);
     }

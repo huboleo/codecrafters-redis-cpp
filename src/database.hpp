@@ -30,6 +30,9 @@ class Database {
         // Stream specific error
         INVALID_STREAM_ID_MODE,
         INVALID_STREAM_ID_VALUE,
+
+        // Incr
+        VALUE_NOT_INTEGER
     };
 
     enum class ValueType {
@@ -72,6 +75,8 @@ class Database {
 
     [[nodiscard]] std::expected<std::vector<rstream::ReadResult>, Error>
     read_streams(std::vector<rstream::ReadRequest> requests, rstream::ReadOptions options);
+
+    [[nodiscard]] std::expected<std::int64_t, Error> increment_key(const std::string& key);
 
   private:
     struct Entry {

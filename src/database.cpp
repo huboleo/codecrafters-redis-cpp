@@ -1,6 +1,7 @@
 #include "database.hpp"
 #include "rstream_types.hpp"
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,20 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+namespace {
+std::optional<std::int64_t> parse_value_to_increment(std::string_view text) {
+    std::int64_t result{};
+
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
+
+    if (text.empty() || error != std::errc{} || end != text.data() + text.size()) {
+        return std::nullopt;
+    }
+
+    return result;
+}
+} // namespace
 
 Database::Entry* Database::find_active_entry(const std::string& key) {
     auto entry = _entries.find(key);
@@ -523,4 +538,35 @@ Database::read_streams(std::vector<rstream::ReadRequest> requests, rstream::Read
     }
 
     return collect_entries();
+}
+
+std::expected<std::int64_t, Database::Error> Database::increment_key(const std::string& key) {
+    std::lock_guard lock(_mutex);
+
+    std::int64_t result;
+
+    Entry* entry = find_active_entry(key);
+
+    if (entry != nullptr) {
+        auto* text = std::get_if<std::string>(&entry->value);
+
+        if (text == nullptr) {
+            return std::unexpected(Database::Error::WRONG_TYPE);
+        }
+
+        auto parsed = parse_value_to_increment(*text);
+
+        if (!parsed) {
+            return std::unexpected(Database::Error::VALUE_NOT_INTEGER);
+        }
+
+        result = ++parsed.value();
+
+        entry->value = std::to_string(result);
+    } else {
+        result = 1;
+        _entries.emplace(key, std::to_string(result));
+    }
+
+    return result;
 }
