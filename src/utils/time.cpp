@@ -29,3 +29,15 @@ std::optional<double> time_utils::parse_blocking_timeout(const std::string& text
 
     return seconds;
 }
+
+std::optional<std::chrono::milliseconds::rep>
+time_utils::parse_stream_blocking_timeout(const std::string& text) {
+    std::chrono::milliseconds::rep count{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
+
+    if (error != std::errc{} || end != text.data() + text.size() || count < 0) {
+        return std::nullopt;
+    }
+
+    return count;
+}

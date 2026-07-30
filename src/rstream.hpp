@@ -13,4 +13,6 @@ std::optional<IdRequest> parse_id(std::string_view id);
 
 [[nodiscard]] resp::Response xrange(Database& database, const resp::Command& command);
 
+[[nodiscard]] resp::Response xread(Database& database, const resp::Command& command);
+
 } // namespace rstream

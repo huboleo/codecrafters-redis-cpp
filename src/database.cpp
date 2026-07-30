@@ -79,7 +79,7 @@ Database::ValueType Database::get_type(const std::string& key) {
         return ValueType::LIST;
     }
 
-    if (std::holds_alternative<std::vector<StreamEntry>>(entry->value)) {
+    if (std::holds_alternative<std::vector<rstream::StreamEntry>>(entry->value)) {
         return ValueType::STREAM;
     }
 
@@ -302,92 +302,96 @@ Database::pop_list_element_blocking(const std::string& key,
     return result;
 }
 
-std::expected<Database::StreamId, Database::Error>
+std::expected<rstream::StreamId, Database::Error>
 Database::add_stream(const std::string& key, rstream::IdRequest id,
                      std::vector<std::pair<std::string, std::string>> values) {
-    std::lock_guard lock(_mutex);
+    rstream::StreamId new_stream_id{};
 
-    Entry* entry = find_active_entry(key);
+    {
+        std::lock_guard lock(_mutex);
 
-    if (!entry) {
-        auto inserted_entry = _entries.emplace(key, std::vector<StreamEntry>{}).first;
+        Entry* entry = find_active_entry(key);
 
-        entry = &inserted_entry->second;
-    }
+        if (!entry) {
+            auto inserted_entry = _entries.emplace(key, std::vector<rstream::StreamEntry>{}).first;
 
-    auto* stream = std::get_if<std::vector<StreamEntry>>(&entry->value);
-
-    if (!stream) {
-        return std::unexpected(Error::WRONG_TYPE);
-    }
-    const bool has_entries = !stream->empty();
-
-    const StreamId last_id = has_entries ? stream->back().id : StreamId{};
-
-    StreamId new_stream_id{};
-
-    switch (id.mode) {
-    case rstream::IdRequest::Mode::EXPLICIT:
-        new_stream_id = StreamId{
-            .milliseconds = id.milliseconds,
-            .sequence = id.sequence,
-        };
-        break;
-
-    case rstream::IdRequest::Mode::AUTOMATIC_SEQUENCE: {
-        std::uint64_t sequence = id.milliseconds == 0 ? 1 : 0;
-
-        if (has_entries && id.milliseconds == last_id.milliseconds) {
-            sequence = last_id.sequence + 1;
+            entry = &inserted_entry->second;
         }
 
-        new_stream_id = StreamId{
-            .milliseconds = id.milliseconds,
-            .sequence = sequence,
-        };
+        auto* stream = std::get_if<std::vector<rstream::StreamEntry>>(&entry->value);
 
-        break;
-    }
-    case rstream::IdRequest::Mode::AUTOMATIC: {
-        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::system_clock::now().time_since_epoch())
-                                      .count();
+        if (!stream) {
+            return std::unexpected(Error::WRONG_TYPE);
+        }
+        const bool has_entries = !stream->empty();
 
-        const auto current_time = static_cast<std::uint64_t>(milliseconds);
+        const rstream::StreamId last_id = has_entries ? stream->back().id : rstream::StreamId{};
 
-        if (has_entries && current_time <= last_id.milliseconds) {
-            new_stream_id = StreamId{
-                .milliseconds = last_id.milliseconds,
-                .sequence = last_id.sequence + 1,
+        switch (id.mode) {
+        case rstream::IdRequest::Mode::EXPLICIT:
+            new_stream_id = rstream::StreamId{
+                .milliseconds = id.milliseconds,
+                .sequence = id.sequence,
             };
-        } else {
-            new_stream_id = StreamId{
-                .milliseconds = current_time,
-                .sequence = 0,
+            break;
+
+        case rstream::IdRequest::Mode::AUTOMATIC_SEQUENCE: {
+            std::uint64_t sequence = id.milliseconds == 0 ? 1 : 0;
+
+            if (has_entries && id.milliseconds == last_id.milliseconds) {
+                sequence = last_id.sequence + 1;
+            }
+
+            new_stream_id = rstream::StreamId{
+                .milliseconds = id.milliseconds,
+                .sequence = sequence,
             };
+
+            break;
+        }
+        case rstream::IdRequest::Mode::AUTOMATIC: {
+            const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
+
+            const auto current_time = static_cast<std::uint64_t>(milliseconds);
+
+            if (has_entries && current_time <= last_id.milliseconds) {
+                new_stream_id = rstream::StreamId{
+                    .milliseconds = last_id.milliseconds,
+                    .sequence = last_id.sequence + 1,
+                };
+            } else {
+                new_stream_id = rstream::StreamId{
+                    .milliseconds = current_time,
+                    .sequence = 0,
+                };
+            }
+
+            break;
         }
 
-        break;
+        default:
+            return std::unexpected(Error::INVALID_STREAM_ID_MODE);
+        }
+
+        if (has_entries && new_stream_id <= last_id) {
+            return std::unexpected(Error::INVALID_STREAM_ID_VALUE);
+        }
+
+        stream->push_back(rstream::StreamEntry{
+            .id = new_stream_id,
+            .values = std::move(values),
+        });
     }
 
-    default:
-        return std::unexpected(Error::INVALID_STREAM_ID_MODE);
-    }
-
-    if (has_entries && new_stream_id <= last_id) {
-        return std::unexpected(Error::INVALID_STREAM_ID_VALUE);
-    }
-
-    stream->push_back(StreamEntry{
-        .id = new_stream_id,
-        .values = std::move(values),
-    });
+    _stream_entry_added.notify_all();
 
     return new_stream_id;
 }
 
-std::expected<std::vector<Database::StreamEntry>, Database::Error>
-Database::stream_range(const std::string& key, StreamId start, StreamId end) {
+std::expected<std::vector<rstream::StreamEntry>, Database::Error>
+Database::stream_range(const std::string& key, rstream::StreamId start, rstream::StreamId end) {
 
     std::lock_guard lock(_mutex);
 
@@ -397,15 +401,126 @@ Database::stream_range(const std::string& key, StreamId start, StreamId end) {
         return std::unexpected(Database::Error::KEY_NOT_FOUND);
     }
 
-    auto* stream = std::get_if<std::vector<StreamEntry>>(&entry->value);
+    auto* stream = std::get_if<std::vector<rstream::StreamEntry>>(&entry->value);
 
     if (!stream) {
         return std::unexpected(Database::Error::WRONG_TYPE);
     }
 
-    auto first = std::ranges::lower_bound(*stream, start, std::ranges::less{}, &StreamEntry::id);
+    auto first =
+        std::ranges::lower_bound(*stream, start, std::ranges::less{}, &rstream::StreamEntry::id);
 
-    auto last = std::ranges::upper_bound(*stream, end, std::ranges::less{}, &StreamEntry::id);
+    auto last =
+        std::ranges::upper_bound(*stream, end, std::ranges::less{}, &rstream::StreamEntry::id);
 
-    return std::vector<StreamEntry>(first, last);
+    return std::vector<rstream::StreamEntry>(first, last);
+}
+
+std::expected<std::vector<rstream::ReadResult>, Database::Error>
+Database::read_streams(std::vector<rstream::ReadRequest> requests, rstream::ReadOptions options) {
+    std::unique_lock lock(_mutex);
+
+    for (auto& request : requests) {
+        Entry* entry = find_active_entry(request.key);
+
+        if (entry == nullptr) {
+            if (request.start_mode == rstream::ReadStartMode::LATEST) {
+                request.after_id = rstream::StreamId{};
+                request.start_mode = rstream::ReadStartMode::AFTER_ID;
+            }
+            continue;
+        }
+
+        auto* stream = std::get_if<std::vector<rstream::StreamEntry>>(&entry->value);
+
+        if (stream == nullptr) {
+            return std::unexpected(Error::WRONG_TYPE);
+        }
+
+        if (request.start_mode == rstream::ReadStartMode::LATEST) {
+            request.after_id = stream->empty() ? rstream::StreamId{} : stream->back().id;
+
+            request.start_mode = rstream::ReadStartMode::AFTER_ID;
+        }
+    }
+
+    auto collect_entries = [this,
+                            &requests]() -> std::expected<std::vector<rstream::ReadResult>, Error> {
+        std::vector<rstream::ReadResult> results;
+        results.reserve(requests.size());
+
+        for (const auto& request : requests) {
+            Entry* entry = find_active_entry(request.key);
+
+            if (entry == nullptr) {
+                continue;
+            }
+
+            auto* stream = std::get_if<std::vector<rstream::StreamEntry>>(&entry->value);
+
+            if (stream == nullptr) {
+                return std::unexpected(Error::WRONG_TYPE);
+            }
+
+            const auto first_entry =
+                std::ranges::upper_bound(*stream, request.after_id, {}, &rstream::StreamEntry::id);
+
+            if (first_entry == stream->end()) {
+                continue;
+            }
+
+            results.push_back(
+                rstream::ReadResult{.key = request.key, .entries = {first_entry, stream->end()}});
+        }
+
+        return results;
+    };
+
+    auto available_entries = collect_entries();
+
+    if (!available_entries) {
+        return std::unexpected(available_entries.error());
+    }
+
+    if (!available_entries->empty() || options.mode == rstream::ReadMode::IMMEDIATE) {
+        return available_entries;
+    }
+
+    auto entries_are_available = [this, &requests] {
+        for (const auto& request : requests) {
+            Entry* entry = find_active_entry(request.key);
+
+            if (entry == nullptr) {
+                continue;
+            }
+
+            auto* stream = std::get_if<std::vector<rstream::StreamEntry>>(&entry->value);
+
+            if (stream == nullptr) {
+                continue;
+            }
+
+            const auto first_entry =
+                std::ranges::upper_bound(*stream, request.after_id, {}, &rstream::StreamEntry::id);
+
+            if (first_entry != stream->end()) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    if (options.mode == rstream::ReadMode::BLOCK_INDEFINITELY) {
+        _stream_entry_added.wait(lock, entries_are_available);
+    } else if (options.mode == rstream::ReadMode::BLOCK_WITH_TIMEOUT) {
+        const bool entry_was_added =
+            _stream_entry_added.wait_for(lock, options.timeout, entries_are_available);
+
+        if (!entry_was_added) {
+            return std::unexpected(Error::TIMEOUT);
+        }
+    }
+
+    return collect_entries();
 }

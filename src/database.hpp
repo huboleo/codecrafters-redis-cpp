@@ -39,22 +39,6 @@ class Database {
         STREAM,
     };
 
-    struct StreamId {
-        std::uint64_t milliseconds;
-        std::uint64_t sequence;
-
-        auto operator<=>(const StreamId&) const = default;
-
-        [[nodiscard]] std::string to_string() const {
-            return std::to_string(milliseconds) + "-" + std::to_string(sequence);
-        }
-    };
-
-    struct StreamEntry {
-        StreamId id;
-        std::vector<std::pair<std::string, std::string>> values;
-    };
-
     void set(std::string key, std::string value, std::optional<std::chrono::milliseconds> expiry);
 
     [[nodiscard]] std::expected<std::string, Error> get(const std::string& key);
@@ -79,16 +63,19 @@ class Database {
     pop_list_element_blocking(const std::string& key,
                               std::optional<std::chrono::milliseconds> timeout);
 
-    [[nodiscard]] std::expected<StreamId, Error>
+    [[nodiscard]] std::expected<rstream::StreamId, Error>
     add_stream(const std::string& key, rstream::IdRequest id,
                std::vector<std::pair<std::string, std::string>> values);
 
-    [[nodiscard]] std::expected<std::vector<StreamEntry>, Error>
-    stream_range(const std::string& key, StreamId start, StreamId end);
+    [[nodiscard]] std::expected<std::vector<rstream::StreamEntry>, Error>
+    stream_range(const std::string& key, rstream::StreamId start, rstream::StreamId end);
+
+    [[nodiscard]] std::expected<std::vector<rstream::ReadResult>, Error>
+    read_streams(std::vector<rstream::ReadRequest> requests, rstream::ReadOptions options);
 
   private:
     struct Entry {
-        std::variant<std::string, std::deque<std::string>, std::vector<StreamEntry>> value;
+        std::variant<std::string, std::deque<std::string>, std::vector<rstream::StreamEntry>> value;
         std::optional<std::chrono::steady_clock::time_point> expires_at;
     };
 
@@ -98,4 +85,5 @@ class Database {
     std::unordered_map<std::string, Entry> _entries;
     std::mutex _mutex;
     std::condition_variable _list_changed;
+    std::condition_variable _stream_entry_added;
 };

@@ -135,5 +135,9 @@ resp::Response CommandExecutor::execute(const resp::Command& command) {
         return rstream::xrange(_database, command);
     }
 
+    if (cmd == "XREAD") {
+        return rstream::xread(_database, command);
+    }
+
     return resp::SimpleError{.value = "ERR unknown command"};
 }

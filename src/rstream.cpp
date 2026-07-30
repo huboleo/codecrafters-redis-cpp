@@ -3,7 +3,11 @@
 #include "optional"
 #include "resp.hpp"
 #include "rstream_types.hpp"
+#include "utils/time.hpp"
+#include <algorithm>
 #include <charconv>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -11,6 +15,14 @@
 #include <utility>
 
 namespace {
+bool equals_ignore_case(std::string_view left, std::string_view right) {
+    return left.size() == right.size() &&
+           std::ranges::equal(left, right, [](char left_character, char right_character) {
+               return std::toupper(static_cast<unsigned char>(left_character)) ==
+                      std::toupper(static_cast<unsigned char>(right_character));
+           });
+}
+
 std::optional<std::uint64_t> parse_text_as_number(std::string_view text) {
     std::uint64_t number{};
 
@@ -38,15 +50,44 @@ parse_value_list(std::span<const std::string> values) {
     return result;
 }
 
-std::optional<Database::StreamId> parse_range_start(std::string_view start) {
+std::optional<rstream::StreamId> parse_read_id(std::string_view text) {
+    const auto dash_position = text.find('-');
+
+    if (dash_position == std::string_view::npos) {
+        auto milliseconds = parse_text_as_number(text);
+
+        if (!milliseconds) {
+            return std::nullopt;
+        }
+
+        return rstream::StreamId{
+            .milliseconds = *milliseconds,
+            .sequence = 0,
+        };
+    }
+
+    auto milliseconds = parse_text_as_number(text.substr(0, dash_position));
+    auto sequence = parse_text_as_number(text.substr(dash_position + 1));
+
+    if (!milliseconds || !sequence) {
+        return std::nullopt;
+    }
+
+    return rstream::StreamId{
+        .milliseconds = *milliseconds,
+        .sequence = *sequence,
+    };
+}
+
+std::optional<rstream::StreamId> parse_range_start(std::string_view start) {
     if (start == "-") {
-        return Database::StreamId{
+        return rstream::StreamId{
             .milliseconds = 0,
             .sequence = 0,
         };
     }
 
-    Database::StreamId id{};
+    rstream::StreamId id{};
 
     auto dash_position = start.find_first_of('-');
 
@@ -71,15 +112,15 @@ std::optional<Database::StreamId> parse_range_start(std::string_view start) {
 
     return id;
 }
-std::optional<Database::StreamId> parse_range_stop(std::string_view stop) {
+std::optional<rstream::StreamId> parse_range_stop(std::string_view stop) {
     if (stop == "+") {
-        return Database::StreamId{
+        return rstream::StreamId{
             .milliseconds = std::numeric_limits<std::uint64_t>::max(),
             .sequence = std::numeric_limits<std::uint64_t>::max(),
         };
     }
 
-    Database::StreamId id{};
+    rstream::StreamId id{};
 
     auto dash_position = stop.find_first_of('-');
 
@@ -229,4 +270,135 @@ resp::Response rstream::xrange(Database& database, const resp::Command& command)
     }
 
     return resp::NestedArray{.values = std::move(entries)};
+}
+
+resp::Response rstream::xread(Database& database, const resp::Command& command) {
+    if (command.size() < 4) {
+        return resp::SimpleError{.value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
+                                          "<timeout?> <STREAMS> <name> <id/$>"};
+    }
+
+    ReadOptions read_options{
+        .mode = ReadMode::IMMEDIATE,
+    };
+
+    std::size_t position = 1;
+
+    if (equals_ignore_case(command[position], "BLOCK")) {
+        if (position + 1 >= command.size()) {
+            return resp::SimpleError{.value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
+                                              "<timeout?> <STREAMS> <name> <id/$>"};
+        }
+
+        auto timeout = time_utils::parse_stream_blocking_timeout(command[position + 1]);
+
+        if (!timeout) {
+            return resp::SimpleError{.value = "ERR Invalid timeout value"};
+        }
+
+        if (*timeout == 0) {
+            read_options.mode = ReadMode::BLOCK_INDEFINITELY;
+        } else {
+            read_options.mode = ReadMode::BLOCK_WITH_TIMEOUT;
+            read_options.timeout = std::chrono::milliseconds{*timeout};
+        }
+
+        position += 2;
+    }
+
+    if (position >= command.size() || !equals_ignore_case(command[position], "STREAMS")) {
+        return resp::SimpleError{.value = "ERR STREAMS keyword is required"};
+    }
+
+    ++position;
+
+    std::span<const std::string> keys_and_ids(command.data() + position,
+                                              command.size() - position);
+
+    if (keys_and_ids.empty() || keys_and_ids.size() % 2 != 0) {
+        return resp::SimpleError{
+            .value = "ERR every key must have a corresponding ID",
+        };
+    }
+
+    const std::size_t stream_count = keys_and_ids.size() / 2;
+
+    std::vector<ReadRequest> read_requests;
+    read_requests.reserve(stream_count);
+
+    for (std::size_t i = 0; i < stream_count; ++i) {
+        const std::string& key = keys_and_ids[i];
+        const std::string& id_text = keys_and_ids[i + stream_count];
+
+        if (id_text == "$") {
+            read_requests.push_back(ReadRequest{
+                .key = key,
+                .start_mode = ReadStartMode::LATEST,
+            });
+
+            continue;
+        }
+
+        auto parsed_id = parse_read_id(id_text);
+
+        if (!parsed_id) {
+            return resp::SimpleError{.value = "ERR Invalid id format"};
+        }
+
+        read_requests.push_back(
+            ReadRequest{.key = key, .start_mode = ReadStartMode::AFTER_ID, .after_id = *parsed_id});
+    }
+
+    auto result = database.read_streams(std::move(read_requests), read_options);
+
+    if (!result) {
+        if (result.error() == Database::Error::WRONG_TYPE) {
+            return resp::SimpleError{
+                .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
+        }
+
+        if (result.error() == Database::Error::TIMEOUT) {
+            return resp::NullArray{};
+        }
+
+        return resp::SimpleError{.value = "ERR Unable to read streams"};
+    }
+
+    if (result->empty()) {
+        return resp::NullArray{};
+    }
+
+    std::vector<resp::ArrayElement> streams;
+    streams.reserve(result->size());
+
+    for (auto& read_result : *result) {
+        std::vector<resp::ArrayElement> entries;
+        entries.reserve(read_result.entries.size());
+
+        for (auto& entry : read_result.entries) {
+            std::vector<resp::ArrayElement> field_values;
+            field_values.reserve(entry.values.size() * 2);
+
+            for (auto& [field, value] : entry.values) {
+                field_values.push_back(resp::ArrayElement{.value = std::move(field)});
+                field_values.push_back(resp::ArrayElement{.value = std::move(value)});
+            }
+
+            std::vector<resp::ArrayElement> entry_values;
+            entry_values.reserve(2);
+            entry_values.push_back(resp::ArrayElement{.value = entry.id.to_string()});
+            entry_values.push_back(resp::ArrayElement{.value = std::move(field_values)});
+
+            entries.push_back(resp::ArrayElement{.value = std::move(entry_values)});
+        }
+
+        std::vector<resp::ArrayElement> stream_values;
+        stream_values.reserve(2);
+        stream_values.push_back(resp::ArrayElement{.value = std::move(read_result.key)});
+        stream_values.push_back(resp::ArrayElement{.value = std::move(entries)});
+
+        streams.push_back(resp::ArrayElement{.value = std::move(stream_values)});
+    }
+
+    return resp::NestedArray{.values = std::move(streams)};
 }
