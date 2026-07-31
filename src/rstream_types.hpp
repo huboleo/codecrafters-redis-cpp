@@ -59,6 +59,11 @@ struct ReadRequest {
     StreamId after_id{};
 };
 
+struct ReadCommand {
+    std::vector<ReadRequest> requests;
+    ReadOptions options;
+};
+
 struct ReadResult {
     std::string key;
     std::vector<StreamEntry> entries;

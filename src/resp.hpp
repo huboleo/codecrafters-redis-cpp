@@ -52,16 +52,20 @@ struct Array {
     std::vector<std::string> values;
 };
 
-struct ArrayElement {
-    std::variant<std::string, std::vector<ArrayElement>> value;
+struct Response;
+
+struct ResponseArray {
+    std::vector<Response> values;
 };
 
-struct NestedArray {
-    std::vector<ArrayElement> values;
-};
+using ResponseVariant = std::variant<SimpleString, SimpleError, BulkString, Integer,
+                                     NullBulkString, NullArray, EmptyArray, Array,
+                                     ResponseArray>;
 
-using Response = std::variant<SimpleString, SimpleError, BulkString, Integer, NullBulkString,
-                              NullArray, EmptyArray, Array, NestedArray>;
+struct Response : ResponseVariant {
+    using ResponseVariant::ResponseVariant;
+    using ResponseVariant::operator=;
+};
 
 std::string serialize_response(Response response);
 

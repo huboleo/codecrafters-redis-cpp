@@ -1,6 +1,5 @@
 #include "rstream.hpp"
 #include "database.hpp"
-#include "optional"
 #include "resp.hpp"
 #include "rstream_types.hpp"
 #include "utils/time.hpp"
@@ -9,7 +8,9 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -184,6 +185,94 @@ std::optional<rstream::IdRequest> rstream::parse_id(std::string_view id) {
                      .sequence = *parsed_sequence_part};
 }
 
+std::expected<rstream::ReadCommand, resp::SimpleError>
+rstream::parse_xread(const resp::Command& command) {
+    if (command.size() < 4) {
+        return std::unexpected(resp::SimpleError{
+            .value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
+                     "<timeout?> <STREAMS> <name> <id/$>"});
+    }
+
+    ReadOptions options{
+        .mode = ReadMode::IMMEDIATE,
+    };
+
+    std::size_t position = 1;
+
+    if (equals_ignore_case(command[position], "BLOCK")) {
+        if (position + 1 >= command.size()) {
+            return std::unexpected(resp::SimpleError{
+                .value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
+                         "<timeout?> <STREAMS> <name> <id/$>"});
+        }
+
+        auto timeout = time_utils::parse_stream_blocking_timeout(command[position + 1]);
+
+        if (!timeout) {
+            return std::unexpected(resp::SimpleError{.value = "ERR Invalid timeout value"});
+        }
+
+        if (*timeout == 0) {
+            options.mode = ReadMode::BLOCK_INDEFINITELY;
+        } else {
+            options.mode = ReadMode::BLOCK_WITH_TIMEOUT;
+            options.timeout = std::chrono::milliseconds{*timeout};
+        }
+
+        position += 2;
+    }
+
+    if (position >= command.size() || !equals_ignore_case(command[position], "STREAMS")) {
+        return std::unexpected(
+            resp::SimpleError{.value = "ERR STREAMS keyword is required"});
+    }
+
+    ++position;
+
+    std::span<const std::string> keys_and_ids(command.data() + position,
+                                              command.size() - position);
+
+    if (keys_and_ids.empty() || keys_and_ids.size() % 2 != 0) {
+        return std::unexpected(
+            resp::SimpleError{.value = "ERR every key must have a corresponding ID"});
+    }
+
+    const std::size_t stream_count = keys_and_ids.size() / 2;
+
+    std::vector<ReadRequest> requests;
+    requests.reserve(stream_count);
+
+    for (std::size_t index = 0; index < stream_count; ++index) {
+        const std::string& key = keys_and_ids[index];
+        const std::string& id_text = keys_and_ids[index + stream_count];
+
+        if (id_text == "$") {
+            requests.push_back(ReadRequest{
+                .key = key,
+                .start_mode = ReadStartMode::LATEST,
+            });
+            continue;
+        }
+
+        auto parsed_id = parse_read_id(id_text);
+
+        if (!parsed_id) {
+            return std::unexpected(resp::SimpleError{.value = "ERR Invalid id format"});
+        }
+
+        requests.push_back(ReadRequest{
+            .key = key,
+            .start_mode = ReadStartMode::AFTER_ID,
+            .after_id = *parsed_id,
+        });
+    }
+
+    return ReadCommand{
+        .requests = std::move(requests),
+        .options = options,
+    };
+}
+
 resp::Response rstream::xadd(Database& database, const resp::Command& command) {
     if (command.size() < 5) {
         return resp::SimpleError{
@@ -249,107 +338,77 @@ resp::Response rstream::xrange(Database& database, const resp::Command& command)
         }
     }
 
-    std::vector<resp::ArrayElement> entries;
+    std::vector<resp::Response> entries;
     entries.reserve(result->size());
 
     for (auto& entry : *result) {
-        std::vector<resp::ArrayElement> values;
+        std::vector<resp::Response> values;
         values.reserve(entry.values.size() * 2);
 
         for (auto& [field, value] : entry.values) {
-            values.push_back(resp::ArrayElement{.value = std::move(field)});
-            values.push_back(resp::ArrayElement{.value = std::move(value)});
+            values.push_back(resp::BulkString{.value = std::move(field)});
+            values.push_back(resp::BulkString{.value = std::move(value)});
         }
 
-        std::vector<resp::ArrayElement> entry_values;
+        std::vector<resp::Response> entry_values;
         entry_values.reserve(2);
-        entry_values.push_back(resp::ArrayElement{.value = entry.id.to_string()});
-        entry_values.push_back(resp::ArrayElement{.value = std::move(values)});
+        entry_values.push_back(resp::BulkString{.value = entry.id.to_string()});
+        entry_values.push_back(resp::ResponseArray{.values = std::move(values)});
 
-        entries.push_back(resp::ArrayElement{.value = std::move(entry_values)});
+        entries.push_back(resp::ResponseArray{.values = std::move(entry_values)});
     }
 
-    return resp::NestedArray{.values = std::move(entries)};
+    return resp::ResponseArray{.values = std::move(entries)};
+}
+
+resp::Response rstream::make_xread_response(std::vector<ReadResult> results) {
+    if (results.empty()) {
+        return resp::NullArray{};
+    }
+
+    std::vector<resp::Response> streams;
+    streams.reserve(results.size());
+
+    for (auto& read_result : results) {
+        std::vector<resp::Response> entries;
+        entries.reserve(read_result.entries.size());
+
+        for (auto& entry : read_result.entries) {
+            std::vector<resp::Response> field_values;
+            field_values.reserve(entry.values.size() * 2);
+
+            for (auto& [field, value] : entry.values) {
+                field_values.push_back(resp::BulkString{.value = std::move(field)});
+                field_values.push_back(resp::BulkString{.value = std::move(value)});
+            }
+
+            std::vector<resp::Response> entry_values;
+            entry_values.reserve(2);
+            entry_values.push_back(resp::BulkString{.value = entry.id.to_string()});
+            entry_values.push_back(resp::ResponseArray{.values = std::move(field_values)});
+
+            entries.push_back(resp::ResponseArray{.values = std::move(entry_values)});
+        }
+
+        std::vector<resp::Response> stream_values;
+        stream_values.reserve(2);
+        stream_values.push_back(resp::BulkString{.value = std::move(read_result.key)});
+        stream_values.push_back(resp::ResponseArray{.values = std::move(entries)});
+
+        streams.push_back(resp::ResponseArray{.values = std::move(stream_values)});
+    }
+
+    return resp::ResponseArray{.values = std::move(streams)};
 }
 
 resp::Response rstream::xread(Database& database, const resp::Command& command) {
-    if (command.size() < 4) {
-        return resp::SimpleError{.value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
-                                          "<timeout?> <STREAMS> <name> <id/$>"};
+    auto read_command = parse_xread(command);
+
+    if (!read_command) {
+        return read_command.error();
     }
 
-    ReadOptions read_options{
-        .mode = ReadMode::IMMEDIATE,
-    };
-
-    std::size_t position = 1;
-
-    if (equals_ignore_case(command[position], "BLOCK")) {
-        if (position + 1 >= command.size()) {
-            return resp::SimpleError{.value = "ERR Invalid usage. Expected usage <XREAD> <BLOCK?> "
-                                              "<timeout?> <STREAMS> <name> <id/$>"};
-        }
-
-        auto timeout = time_utils::parse_stream_blocking_timeout(command[position + 1]);
-
-        if (!timeout) {
-            return resp::SimpleError{.value = "ERR Invalid timeout value"};
-        }
-
-        if (*timeout == 0) {
-            read_options.mode = ReadMode::BLOCK_INDEFINITELY;
-        } else {
-            read_options.mode = ReadMode::BLOCK_WITH_TIMEOUT;
-            read_options.timeout = std::chrono::milliseconds{*timeout};
-        }
-
-        position += 2;
-    }
-
-    if (position >= command.size() || !equals_ignore_case(command[position], "STREAMS")) {
-        return resp::SimpleError{.value = "ERR STREAMS keyword is required"};
-    }
-
-    ++position;
-
-    std::span<const std::string> keys_and_ids(command.data() + position,
-                                              command.size() - position);
-
-    if (keys_and_ids.empty() || keys_and_ids.size() % 2 != 0) {
-        return resp::SimpleError{
-            .value = "ERR every key must have a corresponding ID",
-        };
-    }
-
-    const std::size_t stream_count = keys_and_ids.size() / 2;
-
-    std::vector<ReadRequest> read_requests;
-    read_requests.reserve(stream_count);
-
-    for (std::size_t i = 0; i < stream_count; ++i) {
-        const std::string& key = keys_and_ids[i];
-        const std::string& id_text = keys_and_ids[i + stream_count];
-
-        if (id_text == "$") {
-            read_requests.push_back(ReadRequest{
-                .key = key,
-                .start_mode = ReadStartMode::LATEST,
-            });
-
-            continue;
-        }
-
-        auto parsed_id = parse_read_id(id_text);
-
-        if (!parsed_id) {
-            return resp::SimpleError{.value = "ERR Invalid id format"};
-        }
-
-        read_requests.push_back(
-            ReadRequest{.key = key, .start_mode = ReadStartMode::AFTER_ID, .after_id = *parsed_id});
-    }
-
-    auto result = database.read_streams(std::move(read_requests), read_options);
+    auto result = database.read_streams(read_command->requests);
 
     if (!result) {
         if (result.error() == Database::Error::WRONG_TYPE) {
@@ -357,48 +416,8 @@ resp::Response rstream::xread(Database& database, const resp::Command& command) 
                 .value = "WRONGTYPE Operation against a key holding the wrong kind of value"};
         }
 
-        if (result.error() == Database::Error::TIMEOUT) {
-            return resp::NullArray{};
-        }
-
         return resp::SimpleError{.value = "ERR Unable to read streams"};
     }
 
-    if (result->empty()) {
-        return resp::NullArray{};
-    }
-
-    std::vector<resp::ArrayElement> streams;
-    streams.reserve(result->size());
-
-    for (auto& read_result : *result) {
-        std::vector<resp::ArrayElement> entries;
-        entries.reserve(read_result.entries.size());
-
-        for (auto& entry : read_result.entries) {
-            std::vector<resp::ArrayElement> field_values;
-            field_values.reserve(entry.values.size() * 2);
-
-            for (auto& [field, value] : entry.values) {
-                field_values.push_back(resp::ArrayElement{.value = std::move(field)});
-                field_values.push_back(resp::ArrayElement{.value = std::move(value)});
-            }
-
-            std::vector<resp::ArrayElement> entry_values;
-            entry_values.reserve(2);
-            entry_values.push_back(resp::ArrayElement{.value = entry.id.to_string()});
-            entry_values.push_back(resp::ArrayElement{.value = std::move(field_values)});
-
-            entries.push_back(resp::ArrayElement{.value = std::move(entry_values)});
-        }
-
-        std::vector<resp::ArrayElement> stream_values;
-        stream_values.reserve(2);
-        stream_values.push_back(resp::ArrayElement{.value = std::move(read_result.key)});
-        stream_values.push_back(resp::ArrayElement{.value = std::move(entries)});
-
-        streams.push_back(resp::ArrayElement{.value = std::move(stream_values)});
-    }
-
-    return resp::NestedArray{.values = std::move(streams)};
+    return make_xread_response(std::move(*result));
 }

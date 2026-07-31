@@ -36,14 +36,6 @@ std::expected<std::size_t, resp::ParseError> parse_length(std::string_view text)
     return length;
 }
 
-std::string serialize_line(char prefix, std::string value) {
-    value.reserve(value.size() + 3);
-    value.insert(value.begin(), prefix);
-    value += "\r\n";
-
-    return value;
-}
-
 void append_bulk_string(std::string& output, const std::string& value) {
     output += "$";
     output += std::to_string(value.size());
@@ -52,23 +44,65 @@ void append_bulk_string(std::string& output, const std::string& value) {
     output += "\r\n";
 }
 
-void append_nested_array(std::string& output,
-                         const std::vector<resp::ArrayElement>& values) {
+void append_response(std::string& output, const resp::Response& response);
+
+void append_value(std::string& output, const resp::SimpleString& value) {
+    output += "+";
+    output += value.value;
+    output += "\r\n";
+}
+
+void append_value(std::string& output, const resp::SimpleError& value) {
+    output += "-";
+    output += value.value;
+    output += "\r\n";
+}
+
+void append_value(std::string& output, const resp::BulkString& value) {
+    append_bulk_string(output, value.value);
+}
+
+void append_value(std::string& output, const resp::Integer& value) {
+    output += ":";
+    output += std::to_string(value.value);
+    output += "\r\n";
+}
+
+void append_value(std::string& output, const resp::NullBulkString&) {
+    output += "$-1\r\n";
+}
+
+void append_value(std::string& output, const resp::NullArray&) {
+    output += "*-1\r\n";
+}
+
+void append_value(std::string& output, const resp::EmptyArray&) {
+    output += "*0\r\n";
+}
+
+void append_value(std::string& output, const resp::Array& array) {
     output += "*";
-    output += std::to_string(values.size());
+    output += std::to_string(array.values.size());
     output += "\r\n";
 
-    for (const auto& element : values) {
-        if (const auto* value = std::get_if<std::string>(&element.value)) {
-            append_bulk_string(output, *value);
-            continue;
-        }
-
-        if (const auto* nested_values =
-                std::get_if<std::vector<resp::ArrayElement>>(&element.value)) {
-            append_nested_array(output, *nested_values);
-        }
+    for (const auto& value : array.values) {
+        append_bulk_string(output, value);
     }
+}
+
+void append_value(std::string& output, const resp::ResponseArray& array) {
+    output += "*";
+    output += std::to_string(array.values.size());
+    output += "\r\n";
+
+    for (const auto& response : array.values) {
+        append_response(output, response);
+    }
+}
+
+void append_response(std::string& output, const resp::Response& response) {
+    std::visit([&output](const auto& value) { append_value(output, value); },
+               static_cast<const resp::ResponseVariant&>(response));
 }
 } // namespace
 
@@ -153,59 +187,9 @@ resp::ParseOutcome resp::parse_command(std::string_view input) {
 }
 
 std::string resp::serialize_response(Response response) {
-    if (auto* simple_string = std::get_if<SimpleString>(&response)) {
-        std::string result = std::move(simple_string->value);
+    std::string result;
 
-        return serialize_line('+', std::move(result));
-    }
+    append_response(result, response);
 
-    if (auto* error = std::get_if<SimpleError>(&response)) {
-        std::string result = std::move(error->value);
-
-        return serialize_line('-', std::move(result));
-    }
-
-    if (auto* bulk_string = std::get_if<BulkString>(&response)) {
-        std::string result = std::move(bulk_string->value);
-
-        std::string prefix = "$" + std::to_string(result.size()) + "\r\n";
-
-        result.reserve(prefix.size() + result.size() + 2);
-        result.insert(0, prefix);
-        result += "\r\n";
-
-        return result;
-    }
-
-    if (auto* integer = std::get_if<Integer>(&response)) {
-        return ":" + std::to_string(integer->value) + "\r\n";
-    }
-
-    if (std::holds_alternative<NullBulkString>(response)) {
-        return "$-1\r\n";
-    }
-
-    if (std::holds_alternative<NullArray>(response)) {
-        return "*-1\r\n";
-    }
-
-    if (std::holds_alternative<EmptyArray>(response)) {
-        return "*0\r\n";
-    }
-
-    if (auto* array = std::get_if<Array>(&response)) {
-        std::string result = "*" + std::to_string(array->values.size()) + "\r\n";
-        for (const auto& value : array->values) {
-            append_bulk_string(result, value);
-        }
-        return result;
-    }
-
-    if (auto* nested_array = std::get_if<NestedArray>(&response)) {
-        std::string result;
-        append_nested_array(result, nested_array->values);
-        return result;
-    }
-
-    return {};
+    return result;
 }

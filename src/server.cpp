@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "command_processor.hpp"
 #include "resp.hpp"
 #include <arpa/inet.h>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <variant>
 
 TcpServer::TcpServer(std::uint16_t port) : _port(port) {}
@@ -52,7 +54,7 @@ std::expected<void, std::string> TcpServer::setup_server() {
     return {};
 }
 
-void TcpServer::handle_connection(int client_fd) {
+void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
     std::string input_buffer;
     char receive_buffer[1024];
     while (true) {
@@ -76,15 +78,18 @@ void TcpServer::handle_connection(int client_fd) {
                 return;
             }
 
-            auto& result = std::get<resp::ParseResult>(outcome);
+            auto& parse_result = std::get<resp::ParseResult>(outcome);
 
-            auto execution_result = _executor.execute(result.command);
+            auto future_result =
+                _processor.submit(client_id, std::move(parse_result.command));
 
-            auto serialized_response = resp::serialize_response(std::move(execution_result));
+            auto result = future_result.get();
+
+            auto serialized_response = resp::serialize_response(std::move(result));
 
             send(client_fd, serialized_response.data(), serialized_response.size(), 0);
 
-            input_buffer.erase(0, result.bytes_consumed);
+            input_buffer.erase(0, parse_result.bytes_consumed);
         }
     }
 
@@ -96,13 +101,15 @@ void TcpServer::run() {
         struct sockaddr_in client_addr;
         int client_addr_len = sizeof(client_addr);
 
-        int client_socket_fd =
+        const int client_socket_fd =
             accept(_server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addr_len);
 
         if (client_socket_fd < 0) {
             continue;
         }
 
-        std::thread(&TcpServer::handle_connection, this, client_socket_fd).detach();
+        const std::uint64_t client_id = _next_client_id++;
+
+        std::thread(&TcpServer::handle_connection, this, client_socket_fd, client_id).detach();
     }
 }

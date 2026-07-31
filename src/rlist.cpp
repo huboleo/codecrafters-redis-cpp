@@ -46,6 +46,32 @@ std::expected<int, resp::SimpleError> parse_number_of_elements(std::string_view 
 
 } // namespace
 
+std::expected<rlist::BlockingPopRequest, resp::SimpleError>
+rlist::parse_blpop(const resp::Command& command) {
+    if (command.size() != 3) {
+        return std::unexpected(resp::SimpleError{
+            .value = "ERR invalid syntax. Expected usage BLPOP <list_name> <timeout>"});
+    }
+
+    auto parsed_timeout = time_utils::parse_blocking_timeout(command[2]);
+
+    if (!parsed_timeout) {
+        return std::unexpected(resp::SimpleError{.value = "ERR Invalid timeout value"});
+    }
+
+    std::optional<std::chrono::milliseconds> timeout;
+
+    if (*parsed_timeout > 0) {
+        timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::duration<double>{*parsed_timeout});
+    }
+
+    return BlockingPopRequest{
+        .key = command[1],
+        .timeout = timeout,
+    };
+}
+
 resp::Response rlist::rpush(Database& database, const resp::Command& command) {
     if (command.size() < 3) {
         return resp::SimpleError{
@@ -159,27 +185,13 @@ resp::Response rlist::lpop(Database& database, const resp::Command& command) {
 }
 
 resp::Response rlist::blpop(Database& database, const resp::Command& command) {
-    if (command.size() != 3) {
-        return resp::SimpleError{
-            .value = "ERR invalid syntax. Expected usage BLPOP <list_name> <timeout>"};
+    auto request = parse_blpop(command);
+
+    if (!request) {
+        return request.error();
     }
 
-    auto parsed_timeout = time_utils::parse_blocking_timeout(command[2]);
-
-    if (!parsed_timeout) {
-        return resp::SimpleError{.value = "ERR Invalid timeout value"};
-    }
-
-    std::optional<std::chrono::milliseconds> timeout;
-
-    if (*parsed_timeout > 0) {
-        const auto fractional_seconds = std::chrono::duration<double>{*parsed_timeout};
-
-        timeout =
-            std::chrono::duration_cast<std::chrono::milliseconds>(fractional_seconds);
-    }
-
-    auto result = database.pop_list_element_blocking(command[1], timeout);
+    auto result = database.pop_list_element(request->key);
 
     if (!result) {
         if (result.error() == Database::Error::WRONG_TYPE) {
@@ -189,5 +201,5 @@ resp::Response rlist::blpop(Database& database, const resp::Command& command) {
         return resp::NullArray{};
     }
 
-    return resp::Array{.values = {command[1], std::move(*result)}};
+    return resp::Array{.values = {std::move(request->key), std::move(*result)}};
 }
