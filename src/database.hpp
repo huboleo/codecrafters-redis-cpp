@@ -72,6 +72,8 @@ class Database {
 
     [[nodiscard]] std::expected<std::int64_t, Error> increment_key(const std::string& key);
 
+    [[nodiscard]] std::uint64_t key_revision(const std::string& key);
+
   private:
     struct Entry {
         std::variant<std::string, std::deque<std::string>, std::vector<rstream::StreamEntry>> value;
@@ -81,4 +83,9 @@ class Database {
     Entry* find_active_entry(const std::string& key);
 
     std::unordered_map<std::string, Entry> _entries;
+
+    std::unordered_map<std::string, std::uint64_t> _key_revisions;
+    std::uint64_t _next_revision{1};
+
+    void mark_key_modified(const std::string& key);
 };

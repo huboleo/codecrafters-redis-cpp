@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <future>
 #include <mutex>
@@ -104,6 +105,43 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
 
     const auto& cmd_name = command.front();
 
+    if (cmd_name == "WATCH") {
+        if (command.size() < 2) {
+            return resp::SimpleError{
+                .value = "ERR Invalid syntax. Expected usage: WATCH <key1> <key2> ..."};
+        }
+
+        if (_transactions.contains(client_id)) {
+            return resp::SimpleError{
+                .value = "ERR WATCH inside MULTI is not allowed",
+            };
+        }
+
+        auto& watched = _watched_keys[client_id];
+
+        for (std::size_t i = 1; i < command.size(); ++i) {
+            const auto& key = command[i];
+
+            if (!watched.contains(key)) {
+                watched.emplace(key, _database.key_revision(key));
+            }
+        }
+
+        return resp::SimpleString{.value = "OK"};
+    }
+
+    if (cmd_name == "UNWATCH") {
+        if (command.size() != 1) {
+            return resp::SimpleError{
+                .value = "ERR wrong number of arguments for 'unwatch' command",
+            };
+        }
+
+        _watched_keys.erase(client_id);
+
+        return resp::SimpleString{.value = "OK"};
+    }
+
     if (cmd_name == "MULTI") {
         const auto [transaction, inserted] = _transactions.try_emplace(client_id);
 
@@ -124,6 +162,8 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
         if (removed == 0) {
             return resp::SimpleError{.value = "ERR DISCARD without MULTI"};
         }
+
+        _watched_keys.erase(client_id);
 
         return resp::SimpleString{.value = "OK"};
     }
@@ -146,8 +186,27 @@ resp::Response CommandProcessor::execute_transaction(std::uint64_t client_id) {
         return resp::SimpleError{.value = "ERR EXEC without MULTI"};
     }
 
+    bool watched_key_changed = false;
+
+    const auto watched = _watched_keys.find(client_id);
+
+    if (watched != _watched_keys.end()) {
+        for (const auto& [key, original_revision] : watched->second) {
+            if (_database.key_revision(key) != original_revision) {
+                watched_key_changed = true;
+                break;
+            }
+        }
+    }
+
     std::vector<resp::Command> commands = std::move(transaction->second);
     _transactions.erase(transaction);
+
+    _watched_keys.erase(client_id);
+
+    if (watched_key_changed) {
+        return resp::NullArray{};
+    }
 
     if (commands.empty()) {
         return resp::EmptyArray{};
@@ -261,8 +320,7 @@ void CommandProcessor::process_task(Task task) {
         return;
     }
 
-    resp::Response response =
-        process_command(task.client_id, std::move(task.command));
+    resp::Response response = process_command(task.client_id, std::move(task.command));
 
     task.response.set_value(std::move(response));
 }
@@ -304,8 +362,7 @@ void CommandProcessor::retry_pending_stream_reads() {
         if (!result) {
             if (result.error() == Database::Error::WRONG_TYPE) {
                 pending->task.response.set_value(resp::SimpleError{
-                    .value =
-                        "WRONGTYPE Operation against a key holding the wrong kind of value"});
+                    .value = "WRONGTYPE Operation against a key holding the wrong kind of value"});
             } else {
                 pending->task.response.set_value(
                     resp::SimpleError{.value = "ERR Unable to read streams"});
@@ -389,9 +446,7 @@ void CommandProcessor::run(std::stop_token stop_token) {
         {
             std::unique_lock lock(_task_mutex);
 
-            auto task_is_available = [&] {
-                return stop_token.stop_requested() || !_tasks.empty();
-            };
+            auto task_is_available = [&] { return stop_token.stop_requested() || !_tasks.empty(); };
 
             auto deadline = next_pending_deadline();
 

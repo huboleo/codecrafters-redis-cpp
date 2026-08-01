@@ -38,6 +38,7 @@ Database::Entry* Database::find_active_entry(const std::string& key) {
 
     if (entry->second.expires_at && std::chrono::steady_clock::now() >= *entry->second.expires_at) {
         _entries.erase(entry);
+        mark_key_modified(key);
         return nullptr;
     }
 
@@ -52,8 +53,11 @@ void Database::set(std::string key, std::string value,
         expires_at = std::chrono::steady_clock::now() + *expiry;
     }
 
-    _entries.insert_or_assign(std::move(key),
-                              Entry{.value = std::move(value), .expires_at = expires_at});
+    auto entry = _entries
+                     .insert_or_assign(std::move(key),
+                                       Entry{.value = std::move(value), .expires_at = expires_at})
+                     .first;
+    mark_key_modified(entry->first);
 }
 
 std::expected<std::string, Database::Error> Database::get(const std::string& key) {
@@ -97,15 +101,16 @@ Database::ValueType Database::get_type(const std::string& key) {
 std::expected<std::size_t, Database::Error>
 Database::add_list_elements(std::string key, std::vector<std::string> values, ListAddMode mode) {
     Entry* entry = find_active_entry(key);
+    const std::string* revision_key = &key;
 
     if (!entry) {
-        auto inserted_entry =
-            _entries
-                .emplace(std::move(key),
-                         Entry{.value = std::deque<std::string>{}, .expires_at = std::nullopt})
-                .first;
+        auto inserted_entry = _entries
+                                  .emplace(std::move(key), Entry{.value = std::deque<std::string>{},
+                                                                 .expires_at = std::nullopt})
+                                  .first;
 
         entry = &inserted_entry->second;
+        revision_key = &inserted_entry->first;
     }
 
     auto* list = std::get_if<std::deque<std::string>>(&entry->value);
@@ -122,6 +127,7 @@ Database::add_list_elements(std::string key, std::vector<std::string> values, Li
                      std::make_move_iterator(values.rend()));
     }
 
+    mark_key_modified(*revision_key);
     return list->size();
 }
 
@@ -208,6 +214,7 @@ std::expected<std::string, Database::Error> Database::pop_list_element(const std
         _entries.erase(key);
     }
 
+    mark_key_modified(key);
     return result;
 }
 
@@ -247,6 +254,7 @@ Database::pop_list_elements(const std::string& key, int number_of_items) {
         _entries.erase(key);
     }
 
+    mark_key_modified(key);
     return result;
 }
 
@@ -329,6 +337,7 @@ Database::add_stream(const std::string& key, rstream::IdRequest id,
         .values = std::move(values),
     });
 
+    mark_key_modified(key);
     return new_stream_id;
 }
 
@@ -437,5 +446,21 @@ std::expected<std::int64_t, Database::Error> Database::increment_key(const std::
         _entries.emplace(key, std::to_string(result));
     }
 
+    mark_key_modified(key);
     return result;
+}
+
+void Database::mark_key_modified(const std::string& key) { _key_revisions[key] = _next_revision++; }
+
+std::uint64_t Database::key_revision(const std::string& key) {
+    // If key expires, it is marked as modified there
+    find_active_entry(key);
+
+    const auto revision = _key_revisions.find(key);
+
+    if (revision == _key_revisions.end()) {
+        return 0;
+    }
+
+    return revision->second;
 }

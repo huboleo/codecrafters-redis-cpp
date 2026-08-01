@@ -47,10 +47,19 @@ class CommandProcessor {
 
     Database _database;
 
+    // Main task queue
     std::deque<Task> _tasks;
+
+    // Queues for pending blocking operations
     std::deque<PendingListPop> _pending_list_pops;
     std::deque<PendingStreamRead> _pending_stream_reads;
+
+    // Transactions associated with clients
     std::unordered_map<std::uint64_t, std::vector<resp::Command>> _transactions;
+
+    // Watched keys associated with clients. Each client has its own version of the database entry,
+    // from the time of WATCH execution
+    std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>> _watched_keys;
 
     std::mutex _task_mutex;
     std::condition_variable _task_available;
