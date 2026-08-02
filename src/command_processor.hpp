@@ -45,7 +45,14 @@ class CommandProcessor {
         std::optional<std::chrono::steady_clock::time_point> deadline;
     };
 
+    struct ReplicationState {
+        std::string replication_id;
+        std::uint64_t offset;
+    };
+
     Database _database;
+
+    ReplicationState _replication_state;
 
     // Main task queue
     std::deque<Task> _tasks;

@@ -11,7 +11,9 @@
 #include <future>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stop_token>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -66,10 +68,28 @@ constexpr std::array command_handlers{
     return definition->handler(database, command);
 }
 
+std::string generate_replication_id() {
+    constexpr char hexadecimal[] = "0123456789abcdef";
+    constexpr std::size_t replication_id_length = 40;
+
+    std::random_device random;
+    std::uniform_int_distribution<int> distribution{0, 15};
+
+    std::string result(replication_id_length, '\0');
+
+    for (char& character : result) {
+        character = hexadecimal[distribution(random)];
+    }
+
+    return result;
+}
+
 } // namespace
 
 CommandProcessor::CommandProcessor()
-    : _worker([this](std::stop_token stop_token) { run(stop_token); }) {}
+    : _worker([this](std::stop_token stop_token) { run(stop_token); }),
+      _replication_state(
+          ReplicationState{.replication_id = generate_replication_id(), .offset = 0}) {}
 
 CommandProcessor::~CommandProcessor() {
     _worker.request_stop();
@@ -104,6 +124,16 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
     }
 
     const auto& cmd_name = command.front();
+
+    if (cmd_name == "INFO") {
+        return resp::BulkString{.value = "# Replication\r\n"
+                                         "role:master\r\n"
+                                         "master_replid:" +
+                                         _replication_state.replication_id +
+                                         "\r\n"
+                                         "master_repl_offset:" +
+                                         std::to_string(_replication_state.offset) + "\r\n"};
+    }
 
     if (cmd_name == "WATCH") {
         if (command.size() < 2) {
