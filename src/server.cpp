@@ -1,6 +1,7 @@
 #include "server.hpp"
 #include "command_processor.hpp"
 #include "resp.hpp"
+#include "server_config.hpp"
 #include <arpa/inet.h>
 #include <cstdint>
 #include <cstdlib>
@@ -15,7 +16,8 @@
 #include <utility>
 #include <variant>
 
-TcpServer::TcpServer(std::uint16_t port) : _port(port) {}
+TcpServer::TcpServer(ServerConfig config)
+    : _config(std::move(config)), _processor(_config.replica_of) {}
 
 TcpServer::~TcpServer() {
     if (_server_fd >= 0) {
@@ -38,7 +40,7 @@ std::expected<void, std::string> TcpServer::setup_server() {
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(_port);
+    server_addr.sin_port = htons(_config.port);
 
     if (bind(_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
         close(_server_fd);
@@ -80,8 +82,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
 
             auto& parse_result = std::get<resp::ParseResult>(outcome);
 
-            auto future_result =
-                _processor.submit(client_id, std::move(parse_result.command));
+            auto future_result = _processor.submit(client_id, std::move(parse_result.command));
 
             auto result = future_result.get();
 

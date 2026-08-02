@@ -1,12 +1,14 @@
 #pragma once
 #include "command_processor.hpp"
+#include "server_config.hpp"
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 
 class TcpServer {
   public:
-    explicit TcpServer(std::uint16_t port);
+    explicit TcpServer(ServerConfig config);
     ~TcpServer();
     TcpServer(const TcpServer&) = delete;
     TcpServer& operator=(const TcpServer&) = delete;
@@ -15,9 +17,9 @@ class TcpServer {
     void run();
 
   private:
+    ServerConfig _config;
     std::uint64_t _next_client_id = 1;
     int _server_fd = -1;
-    std::uint16_t _port;
     CommandProcessor _processor;
     void handle_connection(int client_fd, std::uint64_t client_id);
 };

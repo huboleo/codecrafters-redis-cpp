@@ -2,6 +2,7 @@
 
 #include "database.hpp"
 #include "resp.hpp"
+#include "server_config.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -17,7 +18,7 @@
 
 class CommandProcessor {
   public:
-    CommandProcessor();
+    explicit CommandProcessor(const std::optional<ReplicaConfig>& replica_of);
     ~CommandProcessor();
 
     CommandProcessor(const CommandProcessor&) = delete;
@@ -27,6 +28,8 @@ class CommandProcessor {
                                                      resp::Command command);
 
   private:
+    enum class ReplicationRole { MASTER, REPLICA };
+
     struct Task {
         std::uint64_t client_id;
         resp::Command command;
@@ -46,6 +49,7 @@ class CommandProcessor {
     };
 
     struct ReplicationState {
+        ReplicationRole role;
         std::string replication_id;
         std::uint64_t offset;
     };
@@ -95,4 +99,6 @@ class CommandProcessor {
     next_pending_deadline() const;
 
     resp::Response execute_transaction(std::uint64_t client_id);
+
+    std::string_view get_replication_role() const;
 };

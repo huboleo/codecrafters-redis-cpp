@@ -3,11 +3,13 @@
 #include "resp.hpp"
 #include "rlist.hpp"
 #include "rstream.hpp"
+#include "server_config.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -86,10 +88,12 @@ std::string generate_replication_id() {
 
 } // namespace
 
-CommandProcessor::CommandProcessor()
-    : _worker([this](std::stop_token stop_token) { run(stop_token); }),
-      _replication_state(
-          ReplicationState{.replication_id = generate_replication_id(), .offset = 0}) {}
+CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of)
+    : _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
+                                                                         : ReplicationRole::MASTER,
+                                          .replication_id = generate_replication_id(),
+                                          .offset = 0}),
+      _worker([this](std::stop_token stop_token) { run(stop_token); }) {}
 
 CommandProcessor::~CommandProcessor() {
     _worker.request_stop();
@@ -98,6 +102,13 @@ CommandProcessor::~CommandProcessor() {
     if (_worker.joinable()) {
         _worker.join();
     }
+}
+
+std::string_view CommandProcessor::get_replication_role() const {
+    if (_replication_state.role == ReplicationRole::MASTER) {
+        return "master";
+    }
+    return "slave";
 }
 
 std::future<resp::Response> CommandProcessor::submit(std::uint64_t client_id,
@@ -126,13 +137,15 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
     const auto& cmd_name = command.front();
 
     if (cmd_name == "INFO") {
-        return resp::BulkString{.value = "# Replication\r\n"
-                                         "role:master\r\n"
-                                         "master_replid:" +
-                                         _replication_state.replication_id +
-                                         "\r\n"
-                                         "master_repl_offset:" +
-                                         std::to_string(_replication_state.offset) + "\r\n"};
+        return resp::BulkString{
+            .value = std::format("# Replication\r\n"
+                                 "role:{}\r\n"
+                                 "master_replid:{}\r\n"
+                                 "master_repl_offset:{}\r\n",
+                                 get_replication_role(), _replication_state.replication_id,
+                                 _replication_state.offset),
+        };
+        ;
     }
 
     if (cmd_name == "WATCH") {
