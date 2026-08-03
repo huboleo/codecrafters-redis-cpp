@@ -22,6 +22,11 @@ class TcpServer {
     void run();
 
   private:
+    struct FullResync {
+        std::string replication_id;
+        std::uint64_t offset;
+    };
+
     ServerConfig _config;
     std::uint64_t _next_client_id = 1;
     int _server_fd = -1;
@@ -37,6 +42,8 @@ class TcpServer {
     std::expected<int, std::string> connect_to_master(const ReplicaConfig& replica_config);
 
     std::expected<void, std::string> perform_replication_handshake();
+
+    std::expected<FullResync, std::string> receive_full_resync();
 
     std::expected<void, std::string> send_command(int socket_fd, resp::Command command);
 

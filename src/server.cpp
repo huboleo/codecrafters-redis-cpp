@@ -4,6 +4,7 @@
 #include "server_config.hpp"
 #include <arpa/inet.h>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -244,6 +245,64 @@ std::expected<void, std::string> TcpServer::perform_replication_handshake() {
     return send_command(*_master_fd, {"PSYNC", "?", "-1"});
 }
 
+std::expected<TcpServer::FullResync, std::string> TcpServer::receive_full_resync() {
+    if (!_master_fd) {
+        return std::unexpected("Master connection is not established");
+    }
+
+    auto response = read_master_response_line(*_master_fd);
+
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+
+    constexpr std::string_view prefix = "+FULLRESYNC ";
+    std::string_view payload{*response};
+
+    if (!payload.starts_with(prefix)) {
+        return std::unexpected(
+            std::format("Expected FULLRESYNC response, received {}", *response));
+    }
+
+    payload.remove_prefix(prefix.size());
+
+    const std::size_t separator = payload.find(' ');
+
+    if (separator == std::string_view::npos) {
+        return std::unexpected("Invalid FULLRESYNC response");
+    }
+
+    const std::string_view replication_id = payload.substr(0, separator);
+    const std::string_view offset_text = payload.substr(separator + 1);
+
+    if (replication_id.size() != 40 || offset_text.empty()) {
+        return std::unexpected("Invalid FULLRESYNC response");
+    }
+
+    for (const char character : replication_id) {
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_lowercase_hex = character >= 'a' && character <= 'f';
+        const bool is_uppercase_hex = character >= 'A' && character <= 'F';
+
+        if (!is_digit && !is_lowercase_hex && !is_uppercase_hex) {
+            return std::unexpected("Invalid replication ID in FULLRESYNC response");
+        }
+    }
+
+    std::uint64_t offset{};
+    const auto [end, error] = std::from_chars(
+        offset_text.data(), offset_text.data() + offset_text.size(), offset);
+
+    if (error != std::errc{} || end != offset_text.data() + offset_text.size()) {
+        return std::unexpected("Invalid replication offset in FULLRESYNC response");
+    }
+
+    return FullResync{
+        .replication_id = std::string{replication_id},
+        .offset = offset,
+    };
+}
+
 void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
     std::string input_buffer;
     char receive_buffer[1024];
@@ -318,7 +377,22 @@ void TcpServer::replication_loop(std::stop_token stop_token) {
         return;
     }
 
-    // The FULLRESYNC response, RDB payload, and propagated command stream will be handled here.
+    auto full_resync = receive_full_resync();
+
+    if (!full_resync) {
+        if (!stop_token.stop_requested()) {
+            std::println(stderr, "Failed to receive FULLRESYNC: {}", full_resync.error());
+        }
+
+        return;
+    }
+
+    if (stop_token.stop_requested()) {
+        return;
+    }
+
+    // The RDB payload and propagated command stream will be handled here. The parsed replication
+    // ID and offset remain available in full_resync for those stages.
 }
 
 void TcpServer::run() {
