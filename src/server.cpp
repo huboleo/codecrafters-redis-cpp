@@ -3,12 +3,17 @@
 #include "resp.hpp"
 #include "server_config.hpp"
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <netdb.h>
+#include <print>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <thread>
@@ -20,9 +25,66 @@ TcpServer::TcpServer(ServerConfig config)
     : _config(std::move(config)), _processor(_config.replica_of) {}
 
 TcpServer::~TcpServer() {
+    if (_replication_thread.joinable()) {
+        _replication_thread.request_stop();
+
+        if (_master_fd) {
+            shutdown(*_master_fd, SHUT_RDWR);
+        }
+
+        _replication_thread.join();
+    }
+
     if (_server_fd >= 0) {
         close(_server_fd);
     }
+
+    if (_master_fd && *_master_fd >= 0) {
+        close(*_master_fd);
+    }
+}
+
+std::expected<int, std::string> TcpServer::connect_to_master(const ReplicaConfig& config) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* addresses = nullptr;
+    const std::string port = std::to_string(config.port);
+
+    const int lookup_result = getaddrinfo(config.host.c_str(), port.c_str(), &hints, &addresses);
+
+    if (lookup_result != 0) {
+        return std::unexpected(std::string{"Failed to resolve master address: "} +
+                               gai_strerror(lookup_result));
+    }
+
+    int master_fd = -1;
+
+    for (addrinfo* address = addresses; address != nullptr; address = address->ai_next) {
+        const int candidate_fd =
+            socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+
+        if (candidate_fd < 0) {
+            continue;
+        }
+
+        if (::connect(candidate_fd, address->ai_addr, address->ai_addrlen) == 0) {
+            master_fd = candidate_fd;
+            break;
+        }
+
+        close(candidate_fd);
+    }
+
+    freeaddrinfo(addresses);
+
+    if (master_fd < 0) {
+        return std::unexpected("Failed to connect to master " + config.host + ":" + port);
+    }
+
+    return master_fd;
 }
 
 std::expected<void, std::string> TcpServer::setup_server() {
@@ -54,6 +116,132 @@ std::expected<void, std::string> TcpServer::setup_server() {
     }
 
     return {};
+}
+
+std::expected<void, std::string> TcpServer::setup_replication() {
+    if (!_config.replica_of) {
+        return {};
+    }
+
+    auto master_fd = connect_to_master(*_config.replica_of);
+
+    if (!master_fd) {
+        return std::unexpected(master_fd.error());
+    }
+
+    _master_fd = *master_fd;
+
+    return {};
+}
+
+std::expected<void, std::string> TcpServer::send_command(int socket_fd,
+                                                         resp::Command command) {
+    const std::string serialized = resp::serialize_response(resp::Array{
+        .values = std::move(command),
+    });
+
+    std::size_t bytes_sent = 0;
+
+    while (bytes_sent < serialized.size()) {
+        const ssize_t result =
+            send(socket_fd, serialized.data() + bytes_sent, serialized.size() - bytes_sent, 0);
+
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return std::unexpected("Failed to send command to master");
+        }
+
+        if (result == 0) {
+            return std::unexpected("Master connection closed while sending command");
+        }
+
+        bytes_sent += static_cast<std::size_t>(result);
+    }
+
+    return {};
+}
+
+std::expected<std::string, std::string>
+TcpServer::read_master_response_line(int socket_fd) {
+    while (true) {
+        const std::size_t line_end = _master_input_buffer.find("\r\n");
+
+        if (line_end != std::string::npos) {
+            std::string line = _master_input_buffer.substr(0, line_end);
+            _master_input_buffer.erase(0, line_end + 2);
+            return line;
+        }
+
+        char receive_buffer[1024];
+        const ssize_t bytes_read = recv(socket_fd, receive_buffer, sizeof(receive_buffer), 0);
+
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return std::unexpected("Failed to read response from master");
+        }
+
+        if (bytes_read == 0) {
+            return std::unexpected("Master closed the connection");
+        }
+
+        _master_input_buffer.append(receive_buffer, static_cast<std::size_t>(bytes_read));
+    }
+}
+
+std::expected<void, std::string>
+TcpServer::send_command_and_expect(int socket_fd, resp::Command command,
+                                   std::string_view expected_response) {
+    auto send_result = send_command(socket_fd, std::move(command));
+
+    if (!send_result) {
+        return send_result;
+    }
+
+    auto response = read_master_response_line(socket_fd);
+
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+
+    if (*response != expected_response) {
+        return std::unexpected(std::format("Expected response {}, received {}", expected_response,
+                                           *response));
+    }
+
+    return {};
+}
+
+std::expected<void, std::string> TcpServer::perform_replication_handshake() {
+    if (!_master_fd) {
+        return std::unexpected("Master connection is not established");
+    }
+
+    auto result = send_command_and_expect(*_master_fd, {"PING"}, "+PONG");
+
+    if (!result) {
+        return result;
+    }
+
+    result = send_command_and_expect(
+        *_master_fd, {"REPLCONF", "listening-port", std::to_string(_config.port)}, "+OK");
+
+    if (!result) {
+        return result;
+    }
+
+    result = send_command_and_expect(*_master_fd, {"REPLCONF", "capa", "psync2"}, "+OK");
+
+    if (!result) {
+        return result;
+    }
+
+    return send_command(*_master_fd, {"PSYNC", "?", "-1"});
 }
 
 void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
@@ -97,7 +285,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
     close(client_fd);
 }
 
-void TcpServer::run() {
+void TcpServer::run_connection_loop() {
     while (true) {
         struct sockaddr_in client_addr;
         int client_addr_len = sizeof(client_addr);
@@ -113,4 +301,31 @@ void TcpServer::run() {
 
         std::thread(&TcpServer::handle_connection, this, client_socket_fd, client_id).detach();
     }
+}
+
+void TcpServer::replication_loop(std::stop_token stop_token) {
+    auto handshake_result = perform_replication_handshake();
+
+    if (!handshake_result) {
+        if (!stop_token.stop_requested()) {
+            std::println(stderr, "Replication handshake failed: {}", handshake_result.error());
+        }
+
+        return;
+    }
+
+    if (stop_token.stop_requested()) {
+        return;
+    }
+
+    // The FULLRESYNC response, RDB payload, and propagated command stream will be handled here.
+}
+
+void TcpServer::run() {
+    if (_master_fd) {
+        _replication_thread = std::jthread(
+            [this](std::stop_token stop_token) { replication_loop(stop_token); });
+    }
+
+    run_connection_loop();
 }

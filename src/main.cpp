@@ -21,14 +21,22 @@ int main(int argc, char** argv) {
 
     if (!config) {
         std::println(stderr, "{}", config.error());
+        return 1;
     }
 
     TcpServer server(std::move(*config));
 
-    auto setup_result = server.setup_server();
+    auto server_setup_result = server.setup_server();
 
-    if (!setup_result.has_value()) {
-        std::println(stderr, "{}", setup_result.error());
+    if (!server_setup_result.has_value()) {
+        std::println(stderr, "{}", server_setup_result.error());
+        return 1;
+    }
+
+    auto replication_setup_result = server.setup_replication();
+
+    if (!replication_setup_result.has_value()) {
+        std::println(stderr, "{}", replication_setup_result.error());
         return 1;
     }
 

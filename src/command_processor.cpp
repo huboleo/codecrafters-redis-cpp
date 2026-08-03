@@ -145,7 +145,29 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
                                  get_replication_role(), _replication_state.replication_id,
                                  _replication_state.offset),
         };
-        ;
+    }
+
+    if (cmd_name == "REPLCONF") {
+        if (command.size() != 3) {
+            return resp::SimpleError{
+                .value = "ERR wrong number of arguments for 'replconf' command",
+            };
+        }
+
+        return resp::SimpleString{.value = "OK"};
+    }
+
+    if (cmd_name == "PSYNC") {
+        if (command.size() != 3) {
+            return resp::SimpleError{
+                .value = "ERR wrong number of arguments for 'psync' command",
+            };
+        }
+
+        return resp::SimpleString{
+            .value = std::format("FULLRESYNC {} {}", _replication_state.replication_id,
+                                 _replication_state.offset),
+        };
     }
 
     if (cmd_name == "WATCH") {
