@@ -801,6 +801,11 @@ std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_o
                           return true;
                       }
 
+                      if (target_offset == 0) {
+                          ++count;
+                          return false;
+                      }
+
                       const auto acknowledged =
                           _replica_acknowledged_offsets.find(session->client_id());
 
@@ -839,7 +844,7 @@ void CommandProcessor::process_wait(Task task) {
 
     const std::size_t acknowledged = count_acknowledged_replicas(target_offset);
 
-    if (acknowledged >= request->required_replicas) {
+    if (target_offset == 0 || acknowledged >= request->required_replicas) {
         task.response.set_value(resp::Integer{
             .value = static_cast<std::int64_t>(acknowledged),
         });
