@@ -4,6 +4,7 @@
 #include "server_config.hpp"
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -45,12 +46,34 @@ class TcpServer {
 
     std::expected<FullResync, std::string> receive_full_resync();
 
-    std::expected<void, std::string> send_command(int socket_fd, resp::Command command);
+    std::expected<std::string, std::string> receive_rdb_payload();
+
+    std::expected<void, std::string>
+    consume_replication_stream(std::stop_token stop_token);
+
+    std::expected<void, std::string> send_command(int socket_fd,
+                                                  const resp::Command& command);
+
+    std::expected<void, std::string> send_bytes(int socket_fd, std::string_view bytes);
+
+    std::expected<void, std::string>
+    send_full_resync(int socket_fd, const ReplicaRegistration& registration);
+
+    std::expected<void, std::string>
+    run_replica_connection(int socket_fd, ReplicaRegistration registration);
+
+    void send_replication_frames(int socket_fd,
+                                 std::shared_ptr<ReplicaSession> session,
+                                 std::stop_token stop_token);
+
+    std::expected<void, std::string>
+    consume_replica_acknowledgements(int socket_fd, std::uint64_t client_id,
+                                     std::stop_token stop_token);
 
     std::expected<std::string, std::string> read_master_response_line(int socket_fd);
 
     std::expected<void, std::string>
-    send_command_and_expect(int socket_fd, resp::Command command,
+    send_command_and_expect(int socket_fd, const resp::Command& command,
                             std::string_view expected_response);
 
     void handle_connection(int client_fd, std::uint64_t client_id);

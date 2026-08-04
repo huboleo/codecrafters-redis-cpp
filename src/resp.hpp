@@ -31,6 +31,8 @@ using ParseOutcome = std::variant<ParseResult, Incomplete, ParseError>;
 
 [[nodiscard]] ParseOutcome parse_command(std::string_view input);
 
+[[nodiscard]] std::string serialize_command(const Command& command);
+
 // Serializing Response
 
 struct SimpleString {

@@ -186,6 +186,20 @@ resp::ParseOutcome resp::parse_command(std::string_view input) {
     };
 }
 
+std::string resp::serialize_command(const Command& command) {
+    std::string result;
+
+    result += "*";
+    result += std::to_string(command.size());
+    result += "\r\n";
+
+    for (const auto& argument : command) {
+        append_bulk_string(result, argument);
+    }
+
+    return result;
+}
+
 std::string resp::serialize_response(Response response) {
     std::string result;
 
