@@ -266,8 +266,8 @@ std::string generate_replication_id() {
 } // namespace
 
 CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
-                                   const RDBConfig& rdb_config)
-    : _rdb_config(rdb_config),
+                                   const RDBConfig& rdb_config, const AOFConfig& aof_config)
+    : _rdb_config(rdb_config), _aof_config(aof_config),
       _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
                                                                          : ReplicationRole::MASTER,
                                           .replication_id = generate_replication_id(),
@@ -407,6 +407,25 @@ CommandProcessor::load_rdb_entries(std::vector<rdb::StringEntry> entries) {
     return future;
 }
 
+std::future<std::expected<void, std::string>>
+CommandProcessor::initialize_aof(aof::AppendOnlyFile file,
+                                 std::vector<resp::Command> commands) {
+    InitializeAofTask task{
+        .file = std::move(file),
+        .commands = std::move(commands),
+        .completion = {},
+    };
+    std::future<std::expected<void, std::string>> future = task.completion.get_future();
+
+    {
+        std::lock_guard lock(_task_mutex);
+        _tasks.emplace_back(std::move(task));
+    }
+
+    _task_available.notify_one();
+    return future;
+}
+
 resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::Command& command,
                                                  CommandSource source) {
     if (command.empty()) {
@@ -444,6 +463,30 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
         if (command[2] == "dbfilename") {
             return resp::Array{
                 .values = {"dbfilename", _rdb_config.db_filename},
+            };
+        }
+
+        if (command[2] == "appendonly") {
+            return resp::Array{
+                .values = {"appendonly", _aof_config.enabled ? "yes" : "no"},
+            };
+        }
+
+        if (command[2] == "appenddirname") {
+            return resp::Array{
+                .values = {"appenddirname", _aof_config.append_dirname},
+            };
+        }
+
+        if (command[2] == "appendfilename") {
+            return resp::Array{
+                .values = {"appendfilename", _aof_config.append_filename},
+            };
+        }
+
+        if (command[2] == "appendfsync") {
+            return resp::Array{
+                .values = {"appendfsync", _aof_config.append_fsync},
             };
         }
 
@@ -575,13 +618,24 @@ void CommandProcessor::append_client_replication_frame(std::uint64_t client_id,
     _client_write_offsets[client_id] = _replication_state.offset;
 }
 
-void CommandProcessor::append_blocking_pop_frame(const Task& task, const std::string& key) {
-    if (_replication_state.role != ReplicationRole::MASTER ||
-        task.source != CommandSource::CLIENT) {
-        return;
+std::expected<void, std::string>
+CommandProcessor::persist_blocking_pop(const Task& task, const std::string& key) {
+    const std::string payload = resp::serialize_command({"LPOP", key});
+
+    if (_aof_file && task.source != CommandSource::AOF) {
+        auto result = _aof_file->append(payload);
+
+        if (!result) {
+            return std::unexpected(result.error());
+        }
     }
 
-    append_client_replication_frame(task.client_id, resp::serialize_command({"LPOP", key}));
+    if (_replication_state.role == ReplicationRole::MASTER &&
+        task.source == CommandSource::CLIENT) {
+        append_client_replication_frame(task.client_id, payload);
+    }
+
+    return {};
 }
 
 resp::Response CommandProcessor::execute_transaction(std::uint64_t client_id,
@@ -630,28 +684,42 @@ resp::Response CommandProcessor::execute_transaction(std::uint64_t client_id,
 
     const bool replicate_transaction =
         _replication_state.role == ReplicationRole::MASTER && source == CommandSource::CLIENT;
+    const bool persist_transaction = _aof_file.has_value() && source != CommandSource::AOF;
 
-    std::string replication_payload;
+    std::string persistence_payload;
 
     for (auto& command : commands) {
         resp::Response response = dispatch(_database, command);
 
-        if (replicate_transaction && is_write_command(command) &&
+        if ((replicate_transaction || persist_transaction) && is_write_command(command) &&
             write_modified_database(command, response)) {
-            if (replication_payload.empty()) {
-                replication_payload = resp::serialize_command({"MULTI"});
+            if (persistence_payload.empty()) {
+                persistence_payload = resp::serialize_command({"MULTI"});
             }
 
             normalize_replication_command(command, response);
-            replication_payload += resp::serialize_command(command);
+            persistence_payload += resp::serialize_command(command);
         }
 
         responses.push_back(std::move(response));
     }
 
-    if (!replication_payload.empty()) {
-        replication_payload += resp::serialize_command({"EXEC"});
-        append_client_replication_frame(client_id, std::move(replication_payload));
+    if (!persistence_payload.empty()) {
+        persistence_payload += resp::serialize_command({"EXEC"});
+
+        if (persist_transaction) {
+            auto result = _aof_file->append(persistence_payload);
+
+            if (!result) {
+                return resp::SimpleError{
+                    .value = "MISCONF AOF persistence error: " + result.error(),
+                };
+            }
+        }
+
+        if (replicate_transaction) {
+            append_client_replication_frame(client_id, std::move(persistence_payload));
+        }
     }
 
     return resp::ResponseArray{.values = std::move(responses)};
@@ -668,7 +736,14 @@ void CommandProcessor::process_blpop(Task task) {
     auto result = _database.pop_list_element(request->key);
 
     if (result) {
-        append_blocking_pop_frame(task, request->key);
+        auto persistence = persist_blocking_pop(task, request->key);
+
+        if (!persistence) {
+            task.response.set_value(resp::SimpleError{
+                .value = "MISCONF AOF persistence error: " + persistence.error(),
+            });
+            return;
+        }
 
         std::vector<std::string> values;
         values.reserve(2);
@@ -780,18 +855,36 @@ void CommandProcessor::process_task(Task task) {
         return;
     }
 
+    const bool write_command = !transaction_is_active && is_write_command(task.command);
     const bool replicate_direct_write = _replication_state.role == ReplicationRole::MASTER &&
-                                        task.source == CommandSource::CLIENT &&
-                                        !transaction_is_active && is_write_command(task.command);
+                                        task.source == CommandSource::CLIENT && write_command;
+    const bool persist_direct_write =
+        _aof_file.has_value() && task.source != CommandSource::AOF && write_command;
 
     resp::Response response = process_command(task.client_id, task.command, task.source);
+    const bool command_succeeded = !response_is_error(response);
 
-    if (replicate_direct_write && write_modified_database(task.command, response)) {
+    if ((replicate_direct_write || persist_direct_write) &&
+        write_modified_database(task.command, response)) {
         normalize_replication_command(task.command, response);
-        append_client_replication_frame(task.client_id, resp::serialize_command(task.command));
+        std::string payload = resp::serialize_command(task.command);
+
+        if (persist_direct_write) {
+            auto result = _aof_file->append(payload);
+
+            if (!result) {
+                response = resp::SimpleError{
+                    .value = "MISCONF AOF persistence error: " + result.error(),
+                };
+            }
+        }
+
+        if (replicate_direct_write && !response_is_error(response)) {
+            append_client_replication_frame(task.client_id, std::move(payload));
+        }
     }
 
-    if (task.source == CommandSource::MASTER && !response_is_error(response)) {
+    if (task.source == CommandSource::MASTER && command_succeeded) {
         _replication_state.offset += static_cast<std::uint64_t>(task.replication_bytes);
     }
 
@@ -853,6 +946,34 @@ void CommandProcessor::process_rdb_load(LoadRdbTask task) {
     }
 
     task.completion.set_value();
+}
+
+void CommandProcessor::process_aof_initialization(InitializeAofTask task) {
+    constexpr std::uint64_t aof_client_id = std::numeric_limits<std::uint64_t>::max();
+
+    for (auto& command : task.commands) {
+        resp::Response response = process_command(aof_client_id, command, CommandSource::AOF);
+        const auto& response_variant = static_cast<const resp::ResponseVariant&>(response);
+
+        if (const auto* error = std::get_if<resp::SimpleError>(&response_variant)) {
+            _transactions.erase(aof_client_id);
+            _watched_keys.erase(aof_client_id);
+            task.completion.set_value(std::unexpected(
+                "Failed to replay AOF command: " + error->value));
+            return;
+        }
+    }
+
+    if (_transactions.erase(aof_client_id) != 0) {
+        _watched_keys.erase(aof_client_id);
+        task.completion.set_value(
+            std::unexpected("AOF file ended before its transaction was completed"));
+        return;
+    }
+
+    _watched_keys.erase(aof_client_id);
+    _aof_file.emplace(std::move(task.file));
+    task.completion.set_value(std::expected<void, std::string>{});
 }
 
 std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_offset) {
@@ -937,7 +1058,15 @@ void CommandProcessor::retry_pending_list_pops() {
         auto result = _database.pop_list_element(pending->key);
 
         if (result) {
-            append_blocking_pop_frame(pending->task, pending->key);
+            auto persistence = persist_blocking_pop(pending->task, pending->key);
+
+            if (!persistence) {
+                pending->task.response.set_value(resp::SimpleError{
+                    .value = "MISCONF AOF persistence error: " + persistence.error(),
+                });
+                pending = _pending_list_pops.erase(pending);
+                continue;
+            }
 
             std::vector<std::string> values;
             values.reserve(2);
@@ -1138,8 +1267,10 @@ void CommandProcessor::run(std::stop_token stop_token) {
         } else if (auto* acknowledgement_task =
                        std::get_if<AcknowledgeReplicaTask>(&*task)) {
             process_replica_acknowledgement(std::move(*acknowledgement_task));
+        } else if (auto* rdb_task = std::get_if<LoadRdbTask>(&*task)) {
+            process_rdb_load(std::move(*rdb_task));
         } else {
-            process_rdb_load(std::move(std::get<LoadRdbTask>(*task)));
+            process_aof_initialization(std::move(std::get<InitializeAofTask>(*task)));
         }
 
         retry_pending_list_pops();

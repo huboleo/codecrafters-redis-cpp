@@ -76,10 +76,40 @@ bool is_valid_database_filename(std::string_view filename) {
     return !path.has_parent_path() && path != "." && path != "..";
 }
 
+bool is_valid_append_directory(std::string_view directory) {
+    if (directory.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path path{directory};
+
+    if (path.is_absolute() || path == "." || path == "..") {
+        return false;
+    }
+
+    for (const auto& component : path) {
+        if (component == "..") {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 std::expected<ServerConfig, std::string> parse_arguments(int argc, char** argv) {
     ServerConfig config;
+    std::error_code current_path_error;
+    const std::filesystem::path current_path =
+        std::filesystem::current_path(current_path_error);
+
+    if (current_path_error) {
+        return std::unexpected("Cannot determine the current working directory: " +
+                               current_path_error.message());
+    }
+
+    config.rdb_config.dir = current_path.string();
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg{argv[i]};
@@ -143,6 +173,68 @@ std::expected<ServerConfig, std::string> parse_arguments(int argc, char** argv) 
             }
 
             config.rdb_config.db_filename = filename;
+            continue;
+        }
+
+        if (arg == "--appendonly") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --appendonly");
+            }
+
+            const std::string_view value{argv[++i]};
+
+            if (value != "yes" && value != "no") {
+                return std::unexpected("--appendonly must be either 'yes' or 'no'");
+            }
+
+            config.aof_config.enabled = value == "yes";
+            continue;
+        }
+
+        if (arg == "--appenddirname") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --appenddirname");
+            }
+
+            const std::string_view directory{argv[++i]};
+
+            if (!is_valid_append_directory(directory)) {
+                return std::unexpected(
+                    "AOF directory must be a relative path inside the data directory");
+            }
+
+            config.aof_config.append_dirname = directory;
+            continue;
+        }
+
+        if (arg == "--appendfilename") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --appendfilename");
+            }
+
+            const std::string_view filename{argv[++i]};
+
+            if (!is_valid_database_filename(filename)) {
+                return std::unexpected("AOF filename must be a filename without a directory path");
+            }
+
+            config.aof_config.append_filename = filename;
+            continue;
+        }
+
+        if (arg == "--appendfsync") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --appendfsync");
+            }
+
+            const std::string_view policy{argv[++i]};
+
+            if (policy != "always" && policy != "everysec" && policy != "no") {
+                return std::unexpected(
+                    "--appendfsync must be 'always', 'everysec', or 'no'");
+            }
+
+            config.aof_config.append_fsync = policy;
             continue;
         }
 

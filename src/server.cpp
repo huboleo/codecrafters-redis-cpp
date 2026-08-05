@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "aof.hpp"
 #include "command_processor.hpp"
 #include "rdb.hpp"
 #include "resp.hpp"
@@ -29,7 +30,8 @@ constexpr std::string_view empty_rdb_payload{"REDIS0011\xff\0\0\0\0\0\0\0\0", 18
 }
 
 TcpServer::TcpServer(ServerConfig config)
-    : _config(std::move(config)), _processor(_config.replica_of, _config.rdb_config) {}
+    : _config(std::move(config)),
+      _processor(_config.replica_of, _config.rdb_config, _config.aof_config) {}
 
 TcpServer::~TcpServer() {
     if (_replication_thread.joinable()) {
@@ -141,7 +143,24 @@ std::expected<void, std::string> TcpServer::setup_replication() {
     return {};
 }
 
-std::expected<void, std::string> TcpServer::load_rdb() {
+std::expected<void, std::string> TcpServer::initialize_persistence() {
+    if (_config.aof_config.enabled) {
+        auto file = aof::AppendOnlyFile::open(
+            std::filesystem::path{_config.rdb_config.dir}, _config.aof_config);
+
+        if (!file) {
+            return std::unexpected(file.error());
+        }
+
+        auto commands = file->read_commands();
+
+        if (!commands) {
+            return std::unexpected(commands.error());
+        }
+
+        return _processor.initialize_aof(std::move(*file), std::move(*commands)).get();
+    }
+
     const std::filesystem::path path =
         std::filesystem::path{_config.rdb_config.dir} / _config.rdb_config.db_filename;
     auto entries = rdb::read_file(path);

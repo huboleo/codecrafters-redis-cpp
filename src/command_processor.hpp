@@ -1,5 +1,6 @@
 #pragma once
 
+#include "aof.hpp"
 #include "database.hpp"
 #include "rdb.hpp"
 #include "replication.hpp"
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <expected>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -24,7 +26,7 @@
 class CommandProcessor {
   public:
     explicit CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
-                              const RDBConfig& rdb_config);
+                              const RDBConfig& rdb_config, const AOFConfig& aof_config);
     ~CommandProcessor();
 
     CommandProcessor(const CommandProcessor&) = delete;
@@ -48,9 +50,12 @@ class CommandProcessor {
 
     [[nodiscard]] std::future<void> load_rdb_entries(std::vector<rdb::StringEntry> entries);
 
+    [[nodiscard]] std::future<std::expected<void, std::string>>
+    initialize_aof(aof::AppendOnlyFile file, std::vector<resp::Command> commands);
+
   private:
     enum class ReplicationRole { MASTER, REPLICA };
-    enum class CommandSource { CLIENT, MASTER };
+    enum class CommandSource { CLIENT, MASTER, AOF };
 
     struct Task {
         std::uint64_t client_id;
@@ -110,9 +115,15 @@ class CommandProcessor {
         std::promise<void> completion;
     };
 
+    struct InitializeAofTask {
+        aof::AppendOnlyFile file;
+        std::vector<resp::Command> commands;
+        std::promise<std::expected<void, std::string>> completion;
+    };
+
     using ProcessorTask = std::variant<Task, RegisterReplicaTask, InstallReplicationStateTask,
                                        GetReplicationOffsetTask, AcknowledgeReplicaTask,
-                                       LoadRdbTask>;
+                                       LoadRdbTask, InitializeAofTask>;
 
     struct ReplicationState {
         ReplicationRole role;
@@ -123,6 +134,10 @@ class CommandProcessor {
     Database _database;
 
     RDBConfig _rdb_config;
+
+    AOFConfig _aof_config;
+
+    std::optional<aof::AppendOnlyFile> _aof_file;
 
     ReplicationState _replication_state;
 
@@ -170,6 +185,8 @@ class CommandProcessor {
 
     void process_rdb_load(LoadRdbTask task);
 
+    void process_aof_initialization(InitializeAofTask task);
+
     resp::Response process_command(std::uint64_t client_id, resp::Command& command,
                                    CommandSource source);
 
@@ -177,7 +194,8 @@ class CommandProcessor {
 
     void append_client_replication_frame(std::uint64_t client_id, std::string payload);
 
-    void append_blocking_pop_frame(const Task& task, const std::string& key);
+    [[nodiscard]] std::expected<void, std::string>
+    persist_blocking_pop(const Task& task, const std::string& key);
 
     void process_blpop(Task task);
 

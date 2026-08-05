@@ -26,10 +26,10 @@ int main(int argc, char** argv) {
 
     TcpServer server(std::move(*config));
 
-    auto rdb_load_result = server.load_rdb();
+    auto persistence_result = server.initialize_persistence();
 
-    if (!rdb_load_result) {
-        std::println(stderr, "{}", rdb_load_result.error());
+    if (!persistence_result) {
+        std::println(stderr, "{}", persistence_result.error());
         return 1;
     }
 
