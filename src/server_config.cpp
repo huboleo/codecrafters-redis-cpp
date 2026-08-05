@@ -2,8 +2,10 @@
 #include <charconv>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace {
 std::expected<std::uint16_t, std::string> parse_port_number(std::string_view arg) {
@@ -44,6 +46,36 @@ std::expected<ReplicaConfig, std::string> parse_replica_config(std::string_view 
     };
 }
 
+std::expected<void, std::string> validate_directory(std::string_view path) {
+    if (path.empty()) {
+        return std::unexpected("RDB directory cannot be empty");
+    }
+
+    std::error_code error;
+    const auto status = std::filesystem::status(path, error);
+
+    if (error) {
+        return std::unexpected("Cannot access RDB directory '" + std::string{path} +
+                               "': " + error.message());
+    }
+
+    if (!std::filesystem::is_directory(status)) {
+        return std::unexpected("RDB path '" + std::string{path} + "' is not a directory");
+    }
+
+    return {};
+}
+
+bool is_valid_database_filename(std::string_view filename) {
+    if (filename.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path path{filename};
+
+    return !path.has_parent_path() && path != "." && path != "..";
+}
+
 } // namespace
 
 std::expected<ServerConfig, std::string> parse_arguments(int argc, char** argv) {
@@ -79,6 +111,38 @@ std::expected<ServerConfig, std::string> parse_arguments(int argc, char** argv) 
             }
 
             config.replica_of = std::move(*replica);
+            continue;
+        }
+
+        if (arg == "--dir") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --dir");
+            }
+
+            const std::string_view path{argv[++i]};
+
+            auto validation = validate_directory(path);
+
+            if (!validation) {
+                return std::unexpected(validation.error());
+            }
+
+            config.rdb_config.dir = path;
+            continue;
+        }
+
+        if (arg == "--dbfilename") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --dbfilename");
+            }
+
+            const std::string_view filename{argv[++i]};
+
+            if (!is_valid_database_filename(filename)) {
+                return std::unexpected("RDB filename must be a filename without a directory path");
+            }
+
+            config.rdb_config.db_filename = filename;
             continue;
         }
 

@@ -27,7 +27,7 @@ constexpr std::string_view empty_rdb_payload{"REDIS0011\xff\0\0\0\0\0\0\0\0", 18
 }
 
 TcpServer::TcpServer(ServerConfig config)
-    : _config(std::move(config)), _processor(_config.replica_of) {}
+    : _config(std::move(config)), _processor(_config.replica_of, _config.rdb_config) {}
 
 TcpServer::~TcpServer() {
     if (_replication_thread.joinable()) {
@@ -145,8 +145,7 @@ std::expected<void, std::string> TcpServer::send_command(int socket_fd,
     return send_bytes(socket_fd, serialized);
 }
 
-std::expected<void, std::string> TcpServer::send_bytes(int socket_fd,
-                                                       std::string_view bytes) {
+std::expected<void, std::string> TcpServer::send_bytes(int socket_fd, std::string_view bytes) {
     std::size_t bytes_sent = 0;
 
     while (bytes_sent < bytes.size()) {
@@ -158,8 +157,8 @@ std::expected<void, std::string> TcpServer::send_bytes(int socket_fd,
                 continue;
             }
 
-            return std::unexpected(std::format("Failed to send socket data: {}",
-                                               std::strerror(errno)));
+            return std::unexpected(
+                std::format("Failed to send socket data: {}", std::strerror(errno)));
         }
 
         if (result == 0) {
@@ -174,9 +173,8 @@ std::expected<void, std::string> TcpServer::send_bytes(int socket_fd,
 
 std::expected<void, std::string>
 TcpServer::send_full_resync(int socket_fd, const ReplicaRegistration& registration) {
-    const std::string full_resync =
-        std::format("+FULLRESYNC {} {}\r\n", registration.replication_id,
-                    registration.starting_offset);
+    const std::string full_resync = std::format(
+        "+FULLRESYNC {} {}\r\n", registration.replication_id, registration.starting_offset);
 
     auto result = send_bytes(socket_fd, full_resync);
 
@@ -194,8 +192,7 @@ TcpServer::send_full_resync(int socket_fd, const ReplicaRegistration& registrati
     return send_bytes(socket_fd, empty_rdb_payload);
 }
 
-void TcpServer::send_replication_frames(int socket_fd,
-                                        std::shared_ptr<ReplicaSession> session,
+void TcpServer::send_replication_frames(int socket_fd, std::shared_ptr<ReplicaSession> session,
                                         std::stop_token stop_token) {
     while (auto frame = session->wait_for_frame(stop_token)) {
         auto result = send_bytes(socket_fd, (*frame)->payload);
@@ -215,8 +212,7 @@ TcpServer::consume_replica_acknowledgements(int socket_fd, std::uint64_t client_
 
     while (!stop_token.stop_requested()) {
         char receive_buffer[1024];
-        const ssize_t bytes_read =
-            recv(socket_fd, receive_buffer, sizeof(receive_buffer), 0);
+        const ssize_t bytes_read = recv(socket_fd, receive_buffer, sizeof(receive_buffer), 0);
 
         if (bytes_read < 0) {
             if (errno == EINTR) {
@@ -296,8 +292,7 @@ TcpServer::run_replica_connection(int socket_fd, ReplicaRegistration registratio
     return result;
 }
 
-std::expected<std::string, std::string>
-TcpServer::read_master_response_line(int socket_fd) {
+std::expected<std::string, std::string> TcpServer::read_master_response_line(int socket_fd) {
     while (true) {
         const std::size_t line_end = _master_input_buffer.find("\r\n");
 
@@ -342,8 +337,8 @@ TcpServer::send_command_and_expect(int socket_fd, const resp::Command& command,
     }
 
     if (*response != expected_response) {
-        return std::unexpected(std::format("Expected response {}, received {}", expected_response,
-                                           *response));
+        return std::unexpected(
+            std::format("Expected response {}, received {}", expected_response, *response));
     }
 
     return {};
@@ -391,8 +386,7 @@ std::expected<TcpServer::FullResync, std::string> TcpServer::receive_full_resync
     std::string_view payload{*response};
 
     if (!payload.starts_with(prefix)) {
-        return std::unexpected(
-            std::format("Expected FULLRESYNC response, received {}", *response));
+        return std::unexpected(std::format("Expected FULLRESYNC response, received {}", *response));
     }
 
     payload.remove_prefix(prefix.size());
@@ -421,8 +415,8 @@ std::expected<TcpServer::FullResync, std::string> TcpServer::receive_full_resync
     }
 
     std::uint64_t offset{};
-    const auto [end, error] = std::from_chars(
-        offset_text.data(), offset_text.data() + offset_text.size(), offset);
+    const auto [end, error] =
+        std::from_chars(offset_text.data(), offset_text.data() + offset_text.size(), offset);
 
     if (error != std::errc{} || end != offset_text.data() + offset_text.size()) {
         return std::unexpected("Invalid replication offset in FULLRESYNC response");
@@ -446,14 +440,13 @@ std::expected<std::string, std::string> TcpServer::receive_rdb_payload() {
     }
 
     if (header->empty() || header->front() != '$') {
-        return std::unexpected(
-            std::format("Expected RDB bulk length, received {}", *header));
+        return std::unexpected(std::format("Expected RDB bulk length, received {}", *header));
     }
 
     const std::string_view length_text{header->data() + 1, header->size() - 1};
     std::size_t payload_size{};
-    const auto [end, error] = std::from_chars(
-        length_text.data(), length_text.data() + length_text.size(), payload_size);
+    const auto [end, error] =
+        std::from_chars(length_text.data(), length_text.data() + length_text.size(), payload_size);
 
     if (length_text.empty() || error != std::errc{} ||
         end != length_text.data() + length_text.size()) {
@@ -462,8 +455,7 @@ std::expected<std::string, std::string> TcpServer::receive_rdb_payload() {
 
     while (_master_input_buffer.size() < payload_size) {
         char receive_buffer[1024];
-        const ssize_t bytes_read =
-            recv(*_master_fd, receive_buffer, sizeof(receive_buffer), 0);
+        const ssize_t bytes_read = recv(*_master_fd, receive_buffer, sizeof(receive_buffer), 0);
 
         if (bytes_read < 0) {
             if (errno == EINTR) {
@@ -486,8 +478,7 @@ std::expected<std::string, std::string> TcpServer::receive_rdb_payload() {
     return payload;
 }
 
-std::expected<void, std::string>
-TcpServer::consume_replication_stream(std::stop_token stop_token) {
+std::expected<void, std::string> TcpServer::consume_replication_stream(std::stop_token stop_token) {
     if (!_master_fd) {
         return std::unexpected("Master connection is not established");
     }
@@ -501,18 +492,15 @@ TcpServer::consume_replication_stream(std::stop_token stop_token) {
             }
 
             if (const auto* error = std::get_if<resp::ParseError>(&outcome)) {
-                return std::unexpected("Invalid command in replication stream: " +
-                                       error->message);
+                return std::unexpected("Invalid command in replication stream: " + error->message);
             }
 
             auto& parse_result = std::get<resp::ParseResult>(outcome);
             const std::size_t bytes_consumed = parse_result.bytes_consumed;
 
             const bool acknowledgement_requested =
-                parse_result.command.size() == 3 &&
-                parse_result.command[0] == "REPLCONF" &&
-                parse_result.command[1] == "GETACK" &&
-                parse_result.command[2] == "*";
+                parse_result.command.size() == 3 && parse_result.command[0] == "REPLCONF" &&
+                parse_result.command[1] == "GETACK" && parse_result.command[2] == "*";
 
             std::optional<std::uint64_t> acknowledged_offset;
 
@@ -520,12 +508,9 @@ TcpServer::consume_replication_stream(std::stop_token stop_token) {
                 acknowledged_offset = _processor.replication_offset().get();
             }
 
-            auto response = _processor
-                                .apply_replication(std::move(parse_result.command),
-                                                   bytes_consumed)
-                                .get();
-            const auto& response_variant =
-                static_cast<const resp::ResponseVariant&>(response);
+            auto response =
+                _processor.apply_replication(std::move(parse_result.command), bytes_consumed).get();
+            const auto& response_variant = static_cast<const resp::ResponseVariant&>(response);
 
             if (const auto* error = std::get_if<resp::SimpleError>(&response_variant)) {
                 return std::unexpected("Failed to apply replicated command: " + error->value);
@@ -534,22 +519,18 @@ TcpServer::consume_replication_stream(std::stop_token stop_token) {
             _master_input_buffer.erase(0, bytes_consumed);
 
             if (acknowledged_offset) {
-                auto acknowledgement =
-                    send_command(*_master_fd,
-                                 {"REPLCONF", "ACK",
-                                  std::to_string(*acknowledged_offset)});
+                auto acknowledgement = send_command(
+                    *_master_fd, {"REPLCONF", "ACK", std::to_string(*acknowledged_offset)});
 
                 if (!acknowledgement) {
-                    return std::unexpected(
-                        "Failed to acknowledge replication offset: " +
-                        acknowledgement.error());
+                    return std::unexpected("Failed to acknowledge replication offset: " +
+                                           acknowledgement.error());
                 }
             }
         }
 
         char receive_buffer[1024];
-        const ssize_t bytes_read =
-            recv(*_master_fd, receive_buffer, sizeof(receive_buffer), 0);
+        const ssize_t bytes_read = recv(*_master_fd, receive_buffer, sizeof(receive_buffer), 0);
 
         if (bytes_read < 0) {
             if (errno == EINTR) {
@@ -693,8 +674,7 @@ void TcpServer::replication_loop(std::stop_token stop_token) {
     }
 
     _processor
-        .install_replication_state(std::move(full_resync->replication_id),
-                                   full_resync->offset)
+        .install_replication_state(std::move(full_resync->replication_id), full_resync->offset)
         .get();
 
     auto stream_result = consume_replication_stream(stop_token);
@@ -706,8 +686,8 @@ void TcpServer::replication_loop(std::stop_token stop_token) {
 
 void TcpServer::run() {
     if (_master_fd) {
-        _replication_thread = std::jthread(
-            [this](std::stop_token stop_token) { replication_loop(stop_token); });
+        _replication_thread =
+            std::jthread([this](std::stop_token stop_token) { replication_loop(stop_token); });
     }
 
     run_connection_loop();

@@ -118,8 +118,7 @@ constexpr std::array command_handlers{
     },
 };
 
-[[nodiscard]] const CommandDefinition*
-find_command_definition(std::string_view command_name) {
+[[nodiscard]] const CommandDefinition* find_command_definition(std::string_view command_name) {
     const auto definition =
         std::ranges::find(command_handlers, command_name, &CommandDefinition::command);
 
@@ -185,8 +184,7 @@ void normalize_replication_command(resp::Command& command, const resp::Response&
 
 [[nodiscard]] std::optional<std::uint64_t> parse_unsigned_integer(std::string_view text) {
     std::uint64_t value{};
-    const auto [end, error] =
-        std::from_chars(text.data(), text.data() + text.size(), value);
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
 
     if (text.empty() || error != std::errc{} || end != text.data() + text.size()) {
         return std::nullopt;
@@ -218,8 +216,8 @@ parse_wait_request(const resp::Command& command) {
     std::optional<std::chrono::milliseconds> parsed_timeout;
 
     if (*timeout != 0) {
-        parsed_timeout = std::chrono::milliseconds{
-            static_cast<std::chrono::milliseconds::rep>(*timeout)};
+        parsed_timeout =
+            std::chrono::milliseconds{static_cast<std::chrono::milliseconds::rep>(*timeout)};
     }
 
     return WaitRequest{
@@ -262,8 +260,10 @@ std::string generate_replication_id() {
 
 } // namespace
 
-CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of)
-    : _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
+CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
+                                   const RDBConfig& rdb_config)
+    : _rdb_config(rdb_config),
+      _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
                                                                          : ReplicationRole::MASTER,
                                           .replication_id = generate_replication_id(),
                                           .offset = 0}),
@@ -290,16 +290,15 @@ std::future<resp::Response> CommandProcessor::submit(std::uint64_t client_id,
     return enqueue(client_id, std::move(command), CommandSource::CLIENT, 0);
 }
 
-std::future<resp::Response>
-CommandProcessor::apply_replication(resp::Command command, std::size_t bytes_consumed) {
+std::future<resp::Response> CommandProcessor::apply_replication(resp::Command command,
+                                                                std::size_t bytes_consumed) {
     constexpr std::uint64_t replication_client_id = 0;
     return enqueue(replication_client_id, std::move(command), CommandSource::MASTER,
                    bytes_consumed);
 }
 
 std::future<resp::Response> CommandProcessor::enqueue(std::uint64_t client_id,
-                                                      resp::Command command,
-                                                      CommandSource source,
+                                                      resp::Command command, CommandSource source,
                                                       std::size_t replication_bytes) {
     Task task{.client_id = client_id,
               .command = std::move(command),
@@ -319,9 +318,8 @@ std::future<resp::Response> CommandProcessor::enqueue(std::uint64_t client_id,
     return future;
 }
 
-std::future<void>
-CommandProcessor::install_replication_state(std::string replication_id,
-                                            std::uint64_t offset) {
+std::future<void> CommandProcessor::install_replication_state(std::string replication_id,
+                                                              std::uint64_t offset) {
     InstallReplicationStateTask task{
         .replication_id = std::move(replication_id),
         .offset = offset,
@@ -353,8 +351,8 @@ std::future<std::uint64_t> CommandProcessor::replication_offset() {
     return future;
 }
 
-std::future<void>
-CommandProcessor::acknowledge_replica(std::uint64_t client_id, std::uint64_t offset) {
+std::future<void> CommandProcessor::acknowledge_replica(std::uint64_t client_id,
+                                                        std::uint64_t offset) {
     AcknowledgeReplicaTask task{
         .client_id = client_id,
         .offset = offset,
@@ -372,8 +370,7 @@ CommandProcessor::acknowledge_replica(std::uint64_t client_id, std::uint64_t off
     return future;
 }
 
-std::future<ReplicaRegistration>
-CommandProcessor::register_replica(std::uint64_t client_id) {
+std::future<ReplicaRegistration> CommandProcessor::register_replica(std::uint64_t client_id) {
     RegisterReplicaTask task{.client_id = client_id, .registration = {}};
     std::future<ReplicaRegistration> future = task.registration.get_future();
 
@@ -406,6 +403,28 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
                                  get_replication_role(), _replication_state.replication_id,
                                  _replication_state.offset),
         };
+    }
+
+    if (cmd_name == "CONFIG") {
+        if (command.size() != 3 || command[1] != "GET") {
+            return resp::SimpleError{
+                .value = "ERR syntax error",
+            };
+        }
+
+        if (command[2] == "dir") {
+            return resp::Array{
+                .values = {"dir", _rdb_config.dir},
+            };
+        }
+
+        if (command[2] == "dbfilename") {
+            return resp::Array{
+                .values = {"dbfilename", _rdb_config.db_filename},
+            };
+        }
+
+        return resp::EmptyArray{};
     }
 
     if (cmd_name == "REPLCONF") {
@@ -539,8 +558,7 @@ void CommandProcessor::append_blocking_pop_frame(const Task& task, const std::st
         return;
     }
 
-    append_client_replication_frame(task.client_id,
-                                    resp::serialize_command({"LPOP", key}));
+    append_client_replication_frame(task.client_id, resp::serialize_command({"LPOP", key}));
 }
 
 resp::Response CommandProcessor::execute_transaction(std::uint64_t client_id,
@@ -702,9 +720,9 @@ void CommandProcessor::process_xread(Task task) {
 }
 
 void CommandProcessor::process_task(Task task) {
-    const bool reject_replica_write =
-        _replication_state.role == ReplicationRole::REPLICA &&
-        task.source == CommandSource::CLIENT && is_write_command(task.command);
+    const bool reject_replica_write = _replication_state.role == ReplicationRole::REPLICA &&
+                                      task.source == CommandSource::CLIENT &&
+                                      is_write_command(task.command);
 
     if (reject_replica_write) {
         auto transaction = _transactions.find(task.client_id);
@@ -739,30 +757,26 @@ void CommandProcessor::process_task(Task task) {
         return;
     }
 
-    const bool replicate_direct_write =
-        _replication_state.role == ReplicationRole::MASTER &&
-        task.source == CommandSource::CLIENT && !transaction_is_active &&
-        is_write_command(task.command);
+    const bool replicate_direct_write = _replication_state.role == ReplicationRole::MASTER &&
+                                        task.source == CommandSource::CLIENT &&
+                                        !transaction_is_active && is_write_command(task.command);
 
     resp::Response response = process_command(task.client_id, task.command, task.source);
 
     if (replicate_direct_write && write_modified_database(task.command, response)) {
         normalize_replication_command(task.command, response);
-        append_client_replication_frame(task.client_id,
-                                        resp::serialize_command(task.command));
+        append_client_replication_frame(task.client_id, resp::serialize_command(task.command));
     }
 
     if (task.source == CommandSource::MASTER && !response_is_error(response)) {
-        _replication_state.offset +=
-            static_cast<std::uint64_t>(task.replication_bytes);
+        _replication_state.offset += static_cast<std::uint64_t>(task.replication_bytes);
     }
 
     task.response.set_value(std::move(response));
 }
 
 void CommandProcessor::process_replica_registration(RegisterReplicaTask task) {
-    auto session =
-        std::make_shared<ReplicaSession>(task.client_id, _replication_state.offset);
+    auto session = std::make_shared<ReplicaSession>(task.client_id, _replication_state.offset);
 
     _replica_sessions.push_back(session);
 
@@ -773,8 +787,7 @@ void CommandProcessor::process_replica_registration(RegisterReplicaTask task) {
     });
 }
 
-void CommandProcessor::process_replication_state_installation(
-    InstallReplicationStateTask task) {
+void CommandProcessor::process_replication_state_installation(InstallReplicationStateTask task) {
     _replication_state.replication_id = std::move(task.replication_id);
     _replication_state.offset = task.offset;
     task.completion.set_value();
@@ -793,29 +806,27 @@ void CommandProcessor::process_replica_acknowledgement(AcknowledgeReplicaTask ta
 std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_offset) {
     std::size_t count = 0;
 
-    std::erase_if(_replica_sessions,
-                  [this, target_offset, &count](const auto& weak_session) {
-                      auto session = weak_session.lock();
+    std::erase_if(_replica_sessions, [this, target_offset, &count](const auto& weak_session) {
+        auto session = weak_session.lock();
 
-                      if (!session) {
-                          return true;
-                      }
+        if (!session) {
+            return true;
+        }
 
-                      if (target_offset == 0) {
-                          ++count;
-                          return false;
-                      }
+        if (target_offset == 0) {
+            ++count;
+            return false;
+        }
 
-                      const auto acknowledged =
-                          _replica_acknowledged_offsets.find(session->client_id());
+        const auto acknowledged = _replica_acknowledged_offsets.find(session->client_id());
 
-                      if (acknowledged != _replica_acknowledged_offsets.end() &&
-                          acknowledged->second >= target_offset) {
-                          ++count;
-                      }
+        if (acknowledged != _replica_acknowledged_offsets.end() &&
+            acknowledged->second >= target_offset) {
+            ++count;
+        }
 
-                      return false;
-                  });
+        return false;
+    });
 
     return count;
 }
@@ -851,8 +862,7 @@ void CommandProcessor::process_wait(Task task) {
         return;
     }
 
-    append_replication_frame(
-        resp::serialize_command({"REPLCONF", "GETACK", "*"}));
+    append_replication_frame(resp::serialize_command({"REPLCONF", "GETACK", "*"}));
 
     std::optional<std::chrono::steady_clock::time_point> deadline;
 
@@ -931,8 +941,7 @@ void CommandProcessor::retry_pending_waits() {
     auto pending = _pending_waits.begin();
 
     while (pending != _pending_waits.end()) {
-        const std::size_t acknowledged =
-            count_acknowledged_replicas(pending->target_offset);
+        const std::size_t acknowledged = count_acknowledged_replicas(pending->target_offset);
 
         if (acknowledged < pending->required_replicas) {
             ++pending;
@@ -986,8 +995,7 @@ void CommandProcessor::expire_pending_waits() {
             continue;
         }
 
-        const std::size_t acknowledged =
-            count_acknowledged_replicas(pending->target_offset);
+        const std::size_t acknowledged = count_acknowledged_replicas(pending->target_offset);
 
         pending->task.response.set_value(resp::Integer{
             .value = static_cast<std::int64_t>(acknowledged),
@@ -1071,15 +1079,12 @@ void CommandProcessor::run(std::stop_token stop_token) {
             process_task(std::move(*command_task));
         } else if (auto* registration_task = std::get_if<RegisterReplicaTask>(&*task)) {
             process_replica_registration(std::move(*registration_task));
-        } else if (auto* installation_task =
-                       std::get_if<InstallReplicationStateTask>(&*task)) {
-            process_replication_state_installation(
-                std::move(*installation_task));
+        } else if (auto* installation_task = std::get_if<InstallReplicationStateTask>(&*task)) {
+            process_replication_state_installation(std::move(*installation_task));
         } else if (auto* offset_task = std::get_if<GetReplicationOffsetTask>(&*task)) {
             process_replication_offset_request(std::move(*offset_task));
         } else {
-            process_replica_acknowledgement(
-                std::move(std::get<AcknowledgeReplicaTask>(*task)));
+            process_replica_acknowledgement(std::move(std::get<AcknowledgeReplicaTask>(*task)));
         }
 
         retry_pending_list_pops();

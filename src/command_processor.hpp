@@ -5,8 +5,8 @@
 #include "resp.hpp"
 #include "server_config.hpp"
 #include <chrono>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <future>
@@ -22,7 +22,8 @@
 
 class CommandProcessor {
   public:
-    explicit CommandProcessor(const std::optional<ReplicaConfig>& replica_of);
+    explicit CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
+                              const RDBConfig& rdb_config);
     ~CommandProcessor();
 
     CommandProcessor(const CommandProcessor&) = delete;
@@ -31,16 +32,16 @@ class CommandProcessor {
     [[nodiscard]] std::future<resp::Response> submit(std::uint64_t client_id,
                                                      resp::Command command);
 
-    [[nodiscard]] std::future<resp::Response>
-    apply_replication(resp::Command command, std::size_t bytes_consumed);
+    [[nodiscard]] std::future<resp::Response> apply_replication(resp::Command command,
+                                                                std::size_t bytes_consumed);
 
-    [[nodiscard]] std::future<void>
-    install_replication_state(std::string replication_id, std::uint64_t offset);
+    [[nodiscard]] std::future<void> install_replication_state(std::string replication_id,
+                                                              std::uint64_t offset);
 
     [[nodiscard]] std::future<std::uint64_t> replication_offset();
 
-    [[nodiscard]] std::future<void>
-    acknowledge_replica(std::uint64_t client_id, std::uint64_t offset);
+    [[nodiscard]] std::future<void> acknowledge_replica(std::uint64_t client_id,
+                                                        std::uint64_t offset);
 
     [[nodiscard]] std::future<ReplicaRegistration> register_replica(std::uint64_t client_id);
 
@@ -101,10 +102,8 @@ class CommandProcessor {
         std::promise<void> completion;
     };
 
-    using ProcessorTask = std::variant<Task, RegisterReplicaTask,
-                                       InstallReplicationStateTask,
-                                       GetReplicationOffsetTask,
-                                       AcknowledgeReplicaTask>;
+    using ProcessorTask = std::variant<Task, RegisterReplicaTask, InstallReplicationStateTask,
+                                       GetReplicationOffsetTask, AcknowledgeReplicaTask>;
 
     struct ReplicationState {
         ReplicationRole role;
@@ -113,6 +112,8 @@ class CommandProcessor {
     };
 
     Database _database;
+
+    RDBConfig _rdb_config;
 
     ReplicationState _replication_state;
 
@@ -142,9 +143,9 @@ class CommandProcessor {
 
     std::jthread _worker;
 
-    [[nodiscard]] std::future<resp::Response>
-    enqueue(std::uint64_t client_id, resp::Command command, CommandSource source,
-            std::size_t replication_bytes);
+    [[nodiscard]] std::future<resp::Response> enqueue(std::uint64_t client_id,
+                                                      resp::Command command, CommandSource source,
+                                                      std::size_t replication_bytes);
 
     void run(std::stop_token stop_token);
 
@@ -185,8 +186,7 @@ class CommandProcessor {
 
     void expire_pending_waits();
 
-    [[nodiscard]] std::size_t
-    count_acknowledged_replicas(std::uint64_t target_offset);
+    [[nodiscard]] std::size_t count_acknowledged_replicas(std::uint64_t target_offset);
 
     [[nodiscard]] std::optional<std::chrono::steady_clock::time_point>
     next_pending_deadline() const;
