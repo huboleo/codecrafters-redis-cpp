@@ -68,6 +68,18 @@ resp::Response commands::get(Database& database, const resp::Command& command) {
     return resp::BulkString{.value = std::move(*value)};
 }
 
+resp::Response commands::keys(Database& database, const resp::Command& command) {
+    if (command.size() != 2) {
+        return resp::SimpleError{.value = "ERR wrong number of arguments for 'keys' command"};
+    }
+
+    if (command[1] != "*") {
+        return resp::SimpleError{.value = "ERR only the '*' key pattern is supported"};
+    }
+
+    return resp::Array{.values = database.keys()};
+}
+
 resp::Response commands::type(Database& database, const resp::Command& command) {
     if (command.size() != 2) {
         return resp::SimpleError{.value = "ERR invalid syntax. Expected usage TYPE <key>"};

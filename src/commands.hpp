@@ -17,6 +17,9 @@ resp::Response set(Database& database, const resp::Command& command);
 resp::Response get(Database& database, const resp::Command& command);
 
 [[nodiscard]]
+resp::Response keys(Database& database, const resp::Command& command);
+
+[[nodiscard]]
 resp::Response type(Database& database, const resp::Command& command);
 
 [[nodiscard]]

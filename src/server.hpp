@@ -20,6 +20,7 @@ class TcpServer {
     // Returns server socket file descriptor if setup was successful;
     std::expected<void, std::string> setup_server();
     std::expected<void, std::string> setup_replication();
+    std::expected<void, std::string> load_rdb();
     void run();
 
   private:

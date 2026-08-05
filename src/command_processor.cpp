@@ -62,6 +62,11 @@ constexpr std::array command_handlers{
         .access = CommandAccess::READ_ONLY,
     },
     CommandDefinition{
+        .command = "KEYS",
+        .handler = commands::keys,
+        .access = CommandAccess::READ_ONLY,
+    },
+    CommandDefinition{
         .command = "TYPE",
         .handler = commands::type,
         .access = CommandAccess::READ_ONLY,
@@ -373,6 +378,24 @@ std::future<void> CommandProcessor::acknowledge_replica(std::uint64_t client_id,
 std::future<ReplicaRegistration> CommandProcessor::register_replica(std::uint64_t client_id) {
     RegisterReplicaTask task{.client_id = client_id, .registration = {}};
     std::future<ReplicaRegistration> future = task.registration.get_future();
+
+    {
+        std::lock_guard lock(_task_mutex);
+        _tasks.emplace_back(std::move(task));
+    }
+
+    _task_available.notify_one();
+
+    return future;
+}
+
+std::future<void>
+CommandProcessor::load_rdb_entries(std::vector<rdb::StringEntry> entries) {
+    LoadRdbTask task{
+        .entries = std::move(entries),
+        .completion = {},
+    };
+    std::future<void> future = task.completion.get_future();
 
     {
         std::lock_guard lock(_task_mutex);
@@ -803,6 +826,35 @@ void CommandProcessor::process_replica_acknowledgement(AcknowledgeReplicaTask ta
     task.completion.set_value();
 }
 
+void CommandProcessor::process_rdb_load(LoadRdbTask task) {
+    const auto unix_now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+
+    for (auto& entry : task.entries) {
+        std::optional<std::chrono::milliseconds> expiry;
+
+        if (entry.expires_at_unix_ms) {
+            if (unix_now < 0 ||
+                *entry.expires_at_unix_ms <= static_cast<std::uint64_t>(unix_now)) {
+                continue;
+            }
+
+            const std::uint64_t remaining =
+                *entry.expires_at_unix_ms - static_cast<std::uint64_t>(unix_now);
+            const std::uint64_t maximum = static_cast<std::uint64_t>(
+                std::numeric_limits<std::chrono::milliseconds::rep>::max());
+
+            expiry = std::chrono::milliseconds{
+                static_cast<std::chrono::milliseconds::rep>(std::min(remaining, maximum))};
+        }
+
+        _database.set(std::move(entry.key), std::move(entry.value), expiry);
+    }
+
+    task.completion.set_value();
+}
+
 std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_offset) {
     std::size_t count = 0;
 
@@ -1083,8 +1135,11 @@ void CommandProcessor::run(std::stop_token stop_token) {
             process_replication_state_installation(std::move(*installation_task));
         } else if (auto* offset_task = std::get_if<GetReplicationOffsetTask>(&*task)) {
             process_replication_offset_request(std::move(*offset_task));
+        } else if (auto* acknowledgement_task =
+                       std::get_if<AcknowledgeReplicaTask>(&*task)) {
+            process_replica_acknowledgement(std::move(*acknowledgement_task));
         } else {
-            process_replica_acknowledgement(std::move(std::get<AcknowledgeReplicaTask>(*task)));
+            process_rdb_load(std::move(std::get<LoadRdbTask>(*task)));
         }
 
         retry_pending_list_pops();

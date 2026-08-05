@@ -26,6 +26,13 @@ int main(int argc, char** argv) {
 
     TcpServer server(std::move(*config));
 
+    auto rdb_load_result = server.load_rdb();
+
+    if (!rdb_load_result) {
+        std::println(stderr, "{}", rdb_load_result.error());
+        return 1;
+    }
+
     auto server_setup_result = server.setup_server();
 
     if (!server_setup_result.has_value()) {

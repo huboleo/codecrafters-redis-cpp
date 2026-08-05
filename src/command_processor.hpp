@@ -1,6 +1,7 @@
 #pragma once
 
 #include "database.hpp"
+#include "rdb.hpp"
 #include "replication.hpp"
 #include "resp.hpp"
 #include "server_config.hpp"
@@ -44,6 +45,8 @@ class CommandProcessor {
                                                         std::uint64_t offset);
 
     [[nodiscard]] std::future<ReplicaRegistration> register_replica(std::uint64_t client_id);
+
+    [[nodiscard]] std::future<void> load_rdb_entries(std::vector<rdb::StringEntry> entries);
 
   private:
     enum class ReplicationRole { MASTER, REPLICA };
@@ -102,8 +105,14 @@ class CommandProcessor {
         std::promise<void> completion;
     };
 
+    struct LoadRdbTask {
+        std::vector<rdb::StringEntry> entries;
+        std::promise<void> completion;
+    };
+
     using ProcessorTask = std::variant<Task, RegisterReplicaTask, InstallReplicationStateTask,
-                                       GetReplicationOffsetTask, AcknowledgeReplicaTask>;
+                                       GetReplicationOffsetTask, AcknowledgeReplicaTask,
+                                       LoadRdbTask>;
 
     struct ReplicationState {
         ReplicationRole role;
@@ -158,6 +167,8 @@ class CommandProcessor {
     void process_replication_offset_request(GetReplicationOffsetTask task);
 
     void process_replica_acknowledgement(AcknowledgeReplicaTask task);
+
+    void process_rdb_load(LoadRdbTask task);
 
     resp::Response process_command(std::uint64_t client_id, resp::Command& command,
                                    CommandSource source);

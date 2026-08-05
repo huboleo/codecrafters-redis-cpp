@@ -98,6 +98,26 @@ Database::ValueType Database::get_type(const std::string& key) {
     return ValueType::NONE;
 }
 
+std::vector<std::string> Database::keys() {
+    std::vector<std::string> result;
+    result.reserve(_entries.size());
+
+    const auto now = std::chrono::steady_clock::now();
+
+    for (auto entry = _entries.begin(); entry != _entries.end();) {
+        if (entry->second.expires_at && now >= *entry->second.expires_at) {
+            mark_key_modified(entry->first);
+            entry = _entries.erase(entry);
+            continue;
+        }
+
+        result.push_back(entry->first);
+        ++entry;
+    }
+
+    return result;
+}
+
 std::expected<std::size_t, Database::Error>
 Database::add_list_elements(std::string key, std::vector<std::string> values, ListAddMode mode) {
     Entry* entry = find_active_entry(key);

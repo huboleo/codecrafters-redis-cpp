@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "command_processor.hpp"
+#include "rdb.hpp"
 #include "resp.hpp"
 #include "server_config.hpp"
 #include <arpa/inet.h>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <netdb.h>
 #include <print>
@@ -136,6 +138,19 @@ std::expected<void, std::string> TcpServer::setup_replication() {
 
     _master_fd = *master_fd;
 
+    return {};
+}
+
+std::expected<void, std::string> TcpServer::load_rdb() {
+    const std::filesystem::path path =
+        std::filesystem::path{_config.rdb_config.dir} / _config.rdb_config.db_filename;
+    auto entries = rdb::read_file(path);
+
+    if (!entries) {
+        return std::unexpected(entries.error());
+    }
+
+    _processor.load_rdb_entries(std::move(*entries)).get();
     return {};
 }
 

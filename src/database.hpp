@@ -45,6 +45,8 @@ class Database {
 
     [[nodiscard]] ValueType get_type(const std::string& key);
 
+    [[nodiscard]] std::vector<std::string> keys();
+
     [[nodiscard]] std::expected<std::size_t, Error>
     add_list_elements(std::string key, std::vector<std::string> values, ListAddMode mode);
 
