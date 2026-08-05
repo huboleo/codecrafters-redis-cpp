@@ -50,6 +50,7 @@ struct Integer {
 struct NullBulkString {};
 struct NullArray {};
 struct EmptyArray {};
+struct NoResponse {};
 struct Array {
     std::vector<std::string> values;
 };
@@ -61,7 +62,7 @@ struct ResponseArray {
 };
 
 using ResponseVariant = std::variant<SimpleString, SimpleError, BulkString, Integer,
-                                     NullBulkString, NullArray, EmptyArray, Array,
+                                     NullBulkString, NullArray, EmptyArray, NoResponse, Array,
                                      ResponseArray>;
 
 struct Response : ResponseVariant {

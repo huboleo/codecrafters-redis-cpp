@@ -2,6 +2,7 @@
 
 #include "aof.hpp"
 #include "database.hpp"
+#include "pubsub.hpp"
 #include "rdb.hpp"
 #include "replication.hpp"
 #include "resp.hpp"
@@ -20,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -52,6 +54,11 @@ class CommandProcessor {
 
     [[nodiscard]] std::future<std::expected<void, std::string>>
     initialize_aof(aof::AppendOnlyFile file, std::vector<resp::Command> commands);
+
+    [[nodiscard]] std::future<void>
+    register_pubsub_client(std::uint64_t client_id, std::shared_ptr<PubSubSession> session);
+
+    [[nodiscard]] std::future<void> unregister_pubsub_client(std::uint64_t client_id);
 
   private:
     enum class ReplicationRole { MASTER, REPLICA };
@@ -121,9 +128,21 @@ class CommandProcessor {
         std::promise<std::expected<void, std::string>> completion;
     };
 
+    struct RegisterPubSubClientTask {
+        std::uint64_t client_id;
+        std::shared_ptr<PubSubSession> session;
+        std::promise<void> completion;
+    };
+
+    struct UnregisterPubSubClientTask {
+        std::uint64_t client_id;
+        std::promise<void> completion;
+    };
+
     using ProcessorTask = std::variant<Task, RegisterReplicaTask, InstallReplicationStateTask,
                                        GetReplicationOffsetTask, AcknowledgeReplicaTask,
-                                       LoadRdbTask, InitializeAofTask>;
+                                       LoadRdbTask, InitializeAofTask, RegisterPubSubClientTask,
+                                       UnregisterPubSubClientTask>;
 
     struct ReplicationState {
         ReplicationRole role;
@@ -162,6 +181,11 @@ class CommandProcessor {
     // from the time of WATCH execution
     std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>> _watched_keys;
 
+    // Pub/Sub state
+    std::unordered_map<std::uint64_t, std::weak_ptr<PubSubSession>> _pubsub_sessions;
+    std::unordered_map<std::string, std::unordered_set<std::uint64_t>> _channel_subscribers;
+    std::unordered_map<std::uint64_t, std::unordered_set<std::string>> _client_subscriptions;
+
     std::mutex _task_mutex;
     std::condition_variable _task_available;
 
@@ -186,6 +210,19 @@ class CommandProcessor {
     void process_rdb_load(LoadRdbTask task);
 
     void process_aof_initialization(InitializeAofTask task);
+
+    void process_pubsub_registration(RegisterPubSubClientTask task);
+
+    void process_pubsub_unregistration(UnregisterPubSubClientTask task);
+
+    resp::Response subscribe(std::uint64_t client_id, const resp::Command& command);
+
+    resp::Response unsubscribe(std::uint64_t client_id, const resp::Command& command);
+
+    resp::Response publish(const resp::Command& command);
+
+    [[nodiscard]] std::expected<void, std::string>
+    enqueue_pubsub_response(std::uint64_t client_id, resp::Response response);
 
     resp::Response process_command(std::uint64_t client_id, resp::Command& command,
                                    CommandSource source);

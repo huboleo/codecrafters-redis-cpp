@@ -1,10 +1,12 @@
 #include "server.hpp"
 #include "aof.hpp"
 #include "command_processor.hpp"
+#include "pubsub.hpp"
 #include "rdb.hpp"
 #include "resp.hpp"
 #include "server_config.hpp"
 #include <arpa/inet.h>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <netdb.h>
+#include <poll.h>
 #include <print>
 #include <stop_token>
 #include <string>
@@ -593,10 +596,79 @@ std::expected<void, std::string> TcpServer::consume_replication_stream(std::stop
 }
 
 void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
+    auto session_result = PubSubSession::create();
+
+    if (!session_result) {
+        std::println(stderr, "Failed to initialize Pub/Sub session: {}", session_result.error());
+        close(client_fd);
+        return;
+    }
+
+    std::shared_ptr<PubSubSession> session = std::move(*session_result);
+    _processor.register_pubsub_client(client_id, session).get();
+
     std::string input_buffer;
     char receive_buffer[1024];
-    while (true) {
-        ssize_t bytes_read = recv(client_fd, receive_buffer, sizeof(receive_buffer), 0);
+
+    std::array descriptors{
+        pollfd{.fd = client_fd, .events = POLLIN, .revents = 0},
+        pollfd{.fd = session->notification_fd(), .events = POLLIN, .revents = 0},
+    };
+
+    bool connection_open = true;
+
+    auto send_pending_pubsub_frames = [&]() -> std::expected<void, std::string> {
+        auto clear_result = session->clear_notification();
+
+        if (!clear_result) {
+            return clear_result;
+        }
+
+        while (auto frame = session->pop_frame()) {
+            auto send_result = send_bytes(client_fd, (*frame)->payload);
+
+            if (!send_result) {
+                return send_result;
+            }
+        }
+
+        return {};
+    };
+
+    while (connection_open) {
+        const int poll_result =
+            poll(descriptors.data(), static_cast<nfds_t>(descriptors.size()), -1);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            break;
+        }
+
+        if ((descriptors[1].revents & POLLIN) != 0) {
+            auto send_result = send_pending_pubsub_frames();
+
+            if (!send_result) {
+                std::println(stderr, "Failed to send Pub/Sub data: {}", send_result.error());
+                break;
+            }
+        }
+
+        if ((descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            break;
+        }
+
+        if ((descriptors[0].revents & POLLIN) == 0) {
+            if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                break;
+            }
+
+            continue;
+        }
+
+        const ssize_t bytes_read = recv(client_fd, receive_buffer, sizeof(receive_buffer), 0);
 
         if (bytes_read <= 0) {
             break;
@@ -612,8 +684,8 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
             }
 
             if (auto* error = std::get_if<resp::ParseError>(&outcome)) {
-                close(client_fd);
-                return;
+                connection_open = false;
+                break;
             }
 
             auto& parse_result = std::get<resp::ParseResult>(outcome);
@@ -622,6 +694,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
                 parse_result.command.size() == 3 && parse_result.command.front() == "PSYNC";
 
             if (starts_replication) {
+                _processor.unregister_pubsub_client(client_id).get();
                 auto registration = _processor.register_replica(client_id).get();
                 auto replication_result =
                     run_replica_connection(client_fd, std::move(registration));
@@ -639,14 +712,37 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
 
             auto result = future_result.get();
 
+            const bool response_is_queued =
+                std::holds_alternative<resp::NoResponse>(
+                    static_cast<const resp::ResponseVariant&>(result));
+
             auto serialized_response = resp::serialize_response(std::move(result));
 
-            send(client_fd, serialized_response.data(), serialized_response.size(), 0);
+            auto send_result = send_bytes(client_fd, serialized_response);
+
+            if (!send_result) {
+                connection_open = false;
+                break;
+            }
 
             input_buffer.erase(0, parse_result.bytes_consumed);
+
+            if (response_is_queued) {
+                auto queued_send_result = send_pending_pubsub_frames();
+
+                if (!queued_send_result) {
+                    connection_open = false;
+                    break;
+                }
+            }
+        }
+
+        if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            break;
         }
     }
 
+    _processor.unregister_pubsub_client(client_id).get();
     close(client_fd);
 }
 

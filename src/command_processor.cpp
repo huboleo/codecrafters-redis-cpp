@@ -426,6 +426,41 @@ CommandProcessor::initialize_aof(aof::AppendOnlyFile file,
     return future;
 }
 
+std::future<void>
+CommandProcessor::register_pubsub_client(std::uint64_t client_id,
+                                         std::shared_ptr<PubSubSession> session) {
+    RegisterPubSubClientTask task{
+        .client_id = client_id,
+        .session = std::move(session),
+        .completion = {},
+    };
+    std::future<void> future = task.completion.get_future();
+
+    {
+        std::lock_guard lock(_task_mutex);
+        _tasks.emplace_back(std::move(task));
+    }
+
+    _task_available.notify_one();
+    return future;
+}
+
+std::future<void> CommandProcessor::unregister_pubsub_client(std::uint64_t client_id) {
+    UnregisterPubSubClientTask task{
+        .client_id = client_id,
+        .completion = {},
+    };
+    std::future<void> future = task.completion.get_future();
+
+    {
+        std::lock_guard lock(_task_mutex);
+        _tasks.emplace_back(std::move(task));
+    }
+
+    _task_available.notify_one();
+    return future;
+}
+
 resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::Command& command,
                                                  CommandSource source) {
     if (command.empty()) {
@@ -435,6 +470,30 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
     }
 
     const auto& cmd_name = command.front();
+
+    if (cmd_name == "SUBSCRIBE") {
+        return subscribe(client_id, command);
+    }
+
+    if (cmd_name == "UNSUBSCRIBE") {
+        return unsubscribe(client_id, command);
+    }
+
+    if (_client_subscriptions.contains(client_id) && cmd_name == "PING") {
+        if (command.size() > 2) {
+            return resp::SimpleError{
+                .value = "ERR wrong number of arguments for 'ping' command",
+            };
+        }
+
+        return resp::Array{
+            .values = {"pong", command.size() == 2 ? command[1] : ""},
+        };
+    }
+
+    if (cmd_name == "PUBLISH") {
+        return publish(command);
+    }
 
     if (cmd_name == "INFO") {
         return resp::BulkString{
@@ -818,6 +877,33 @@ void CommandProcessor::process_xread(Task task) {
 }
 
 void CommandProcessor::process_task(Task task) {
+    const bool client_is_subscribed =
+        task.source == CommandSource::CLIENT && _client_subscriptions.contains(task.client_id);
+    const bool command_is_allowed_while_subscribed =
+        !task.command.empty() &&
+        (task.command.front() == "SUBSCRIBE" || task.command.front() == "UNSUBSCRIBE" ||
+         task.command.front() == "PING");
+
+    if (client_is_subscribed && !command_is_allowed_while_subscribed) {
+        resp::Response response = resp::SimpleError{
+            .value = std::format(
+                "ERR Can't execute '{}': only SUBSCRIBE, UNSUBSCRIBE and PING are allowed in "
+                "this context",
+                task.command.empty() ? "" : task.command.front()),
+        };
+        auto enqueue_result = enqueue_pubsub_response(task.client_id, std::move(response));
+
+        if (enqueue_result) {
+            task.response.set_value(resp::NoResponse{});
+        } else {
+            task.response.set_value(resp::SimpleError{
+                .value = "ERR failed to queue Pub/Sub response: " + enqueue_result.error(),
+            });
+        }
+
+        return;
+    }
+
     const bool reject_replica_write = _replication_state.role == ReplicationRole::REPLICA &&
                                       task.source == CommandSource::CLIENT &&
                                       is_write_command(task.command);
@@ -886,6 +972,23 @@ void CommandProcessor::process_task(Task task) {
 
     if (task.source == CommandSource::MASTER && command_succeeded) {
         _replication_state.offset += static_cast<std::uint64_t>(task.replication_bytes);
+    }
+
+    const bool response_already_queued =
+        std::holds_alternative<resp::NoResponse>(
+            static_cast<const resp::ResponseVariant&>(response));
+
+    if (task.source == CommandSource::CLIENT &&
+        _client_subscriptions.contains(task.client_id) && !response_already_queued) {
+        auto enqueue_result = enqueue_pubsub_response(task.client_id, std::move(response));
+
+        if (enqueue_result) {
+            response = resp::NoResponse{};
+        } else {
+            response = resp::SimpleError{
+                .value = "ERR failed to queue Pub/Sub response: " + enqueue_result.error(),
+            };
+        }
     }
 
     task.response.set_value(std::move(response));
@@ -974,6 +1077,280 @@ void CommandProcessor::process_aof_initialization(InitializeAofTask task) {
     _watched_keys.erase(aof_client_id);
     _aof_file.emplace(std::move(task.file));
     task.completion.set_value(std::expected<void, std::string>{});
+}
+
+void CommandProcessor::process_pubsub_registration(RegisterPubSubClientTask task) {
+    _pubsub_sessions.insert_or_assign(task.client_id, std::move(task.session));
+    task.completion.set_value();
+}
+
+void CommandProcessor::process_pubsub_unregistration(UnregisterPubSubClientTask task) {
+    auto subscriptions = _client_subscriptions.find(task.client_id);
+
+    if (subscriptions != _client_subscriptions.end()) {
+        for (const auto& channel : subscriptions->second) {
+            auto subscribers = _channel_subscribers.find(channel);
+
+            if (subscribers == _channel_subscribers.end()) {
+                continue;
+            }
+
+            subscribers->second.erase(task.client_id);
+
+            if (subscribers->second.empty()) {
+                _channel_subscribers.erase(subscribers);
+            }
+        }
+
+        _client_subscriptions.erase(subscriptions);
+    }
+
+    _pubsub_sessions.erase(task.client_id);
+    task.completion.set_value();
+}
+
+resp::Response CommandProcessor::subscribe(std::uint64_t client_id,
+                                           const resp::Command& command) {
+    if (command.size() < 2) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'subscribe' command",
+        };
+    }
+
+    const auto session_entry = _pubsub_sessions.find(client_id);
+
+    if (session_entry == _pubsub_sessions.end()) {
+        return resp::SimpleError{
+            .value = "ERR Pub/Sub session is not registered",
+        };
+    }
+
+    auto session = session_entry->second.lock();
+
+    if (!session) {
+        _pubsub_sessions.erase(session_entry);
+        return resp::SimpleError{
+            .value = "ERR Pub/Sub session is no longer available",
+        };
+    }
+
+    auto& subscriptions = _client_subscriptions[client_id];
+    std::string acknowledgement_payload;
+
+    for (std::size_t i = 1; i < command.size(); ++i) {
+        const auto& channel = command[i];
+
+        subscriptions.insert(channel);
+        _channel_subscribers[channel].insert(client_id);
+
+        acknowledgement_payload += resp::serialize_response(resp::ResponseArray{
+            .values = {
+                resp::BulkString{.value = "subscribe"},
+                resp::BulkString{.value = channel},
+                resp::Integer{.value = static_cast<std::int64_t>(subscriptions.size())},
+            },
+        });
+    }
+
+    auto frame = std::make_shared<const PubSubFrame>(PubSubFrame{
+        .payload = std::move(acknowledgement_payload),
+    });
+    auto enqueue_result = session->enqueue(std::move(frame));
+
+    if (!enqueue_result) {
+        return resp::SimpleError{
+            .value = "ERR failed to queue Pub/Sub acknowledgement: " + enqueue_result.error(),
+        };
+    }
+
+    return resp::NoResponse{};
+}
+
+resp::Response CommandProcessor::unsubscribe(std::uint64_t client_id,
+                                             const resp::Command& command) {
+    const auto session_entry = _pubsub_sessions.find(client_id);
+
+    if (session_entry == _pubsub_sessions.end()) {
+        return resp::SimpleError{
+            .value = "ERR Pub/Sub session is not registered",
+        };
+    }
+
+    auto session = session_entry->second.lock();
+
+    if (!session) {
+        _pubsub_sessions.erase(session_entry);
+        return resp::SimpleError{
+            .value = "ERR Pub/Sub session is no longer available",
+        };
+    }
+
+    auto remove_subscription = [this, client_id](const std::string& channel) {
+        auto subscriptions = _client_subscriptions.find(client_id);
+
+        if (subscriptions == _client_subscriptions.end()) {
+            return std::size_t{0};
+        }
+
+        if (subscriptions->second.erase(channel) != 0) {
+            auto channel_entry = _channel_subscribers.find(channel);
+
+            if (channel_entry != _channel_subscribers.end()) {
+                channel_entry->second.erase(client_id);
+
+                if (channel_entry->second.empty()) {
+                    _channel_subscribers.erase(channel_entry);
+                }
+            }
+        }
+
+        const std::size_t remaining = subscriptions->second.size();
+
+        if (subscriptions->second.empty()) {
+            _client_subscriptions.erase(subscriptions);
+        }
+
+        return remaining;
+    };
+
+    std::string acknowledgement_payload;
+
+    if (command.size() == 1) {
+        auto subscriptions = _client_subscriptions.find(client_id);
+
+        if (subscriptions == _client_subscriptions.end() || subscriptions->second.empty()) {
+            acknowledgement_payload = resp::serialize_response(resp::ResponseArray{
+                .values = {
+                    resp::BulkString{.value = "unsubscribe"},
+                    resp::NullBulkString{},
+                    resp::Integer{.value = 0},
+                },
+            });
+        } else {
+            std::vector<std::string> channels{subscriptions->second.begin(),
+                                              subscriptions->second.end()};
+
+            for (const auto& channel : channels) {
+                const std::size_t remaining = remove_subscription(channel);
+
+                acknowledgement_payload += resp::serialize_response(resp::ResponseArray{
+                    .values = {
+                        resp::BulkString{.value = "unsubscribe"},
+                        resp::BulkString{.value = channel},
+                        resp::Integer{.value = static_cast<std::int64_t>(remaining)},
+                    },
+                });
+            }
+        }
+    } else {
+        for (std::size_t i = 1; i < command.size(); ++i) {
+            const auto& channel = command[i];
+            const std::size_t remaining = remove_subscription(channel);
+
+            acknowledgement_payload += resp::serialize_response(resp::ResponseArray{
+                .values = {
+                    resp::BulkString{.value = "unsubscribe"},
+                    resp::BulkString{.value = channel},
+                    resp::Integer{.value = static_cast<std::int64_t>(remaining)},
+                },
+            });
+        }
+    }
+
+    auto frame = std::make_shared<const PubSubFrame>(PubSubFrame{
+        .payload = std::move(acknowledgement_payload),
+    });
+    auto enqueue_result = session->enqueue(std::move(frame));
+
+    if (!enqueue_result) {
+        return resp::SimpleError{
+            .value = "ERR failed to queue Pub/Sub acknowledgement: " + enqueue_result.error(),
+        };
+    }
+
+    return resp::NoResponse{};
+}
+
+resp::Response CommandProcessor::publish(const resp::Command& command) {
+    if (command.size() != 3) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'publish' command",
+        };
+    }
+
+    auto subscribers = _channel_subscribers.find(command[1]);
+
+    if (subscribers == _channel_subscribers.end()) {
+        return resp::Integer{.value = 0};
+    }
+
+    auto frame = std::make_shared<const PubSubFrame>(PubSubFrame{
+        .payload = resp::serialize_response(resp::Array{
+            .values = {"message", command[1], command[2]},
+        }),
+    });
+
+    std::int64_t recipients = 0;
+    auto subscriber = subscribers->second.begin();
+
+    while (subscriber != subscribers->second.end()) {
+        const std::uint64_t client_id = *subscriber;
+        const auto session_entry = _pubsub_sessions.find(client_id);
+        std::shared_ptr<PubSubSession> session;
+
+        if (session_entry != _pubsub_sessions.end()) {
+            session = session_entry->second.lock();
+        }
+
+        if (!session) {
+            if (auto client_channels = _client_subscriptions.find(client_id);
+                client_channels != _client_subscriptions.end()) {
+                client_channels->second.erase(command[1]);
+
+                if (client_channels->second.empty()) {
+                    _client_subscriptions.erase(client_channels);
+                }
+            }
+
+            _pubsub_sessions.erase(client_id);
+            subscriber = subscribers->second.erase(subscriber);
+            continue;
+        }
+
+        if (session->enqueue(frame)) {
+            ++recipients;
+        }
+
+        ++subscriber;
+    }
+
+    if (subscribers->second.empty()) {
+        _channel_subscribers.erase(subscribers);
+    }
+
+    return resp::Integer{.value = recipients};
+}
+
+std::expected<void, std::string>
+CommandProcessor::enqueue_pubsub_response(std::uint64_t client_id, resp::Response response) {
+    const auto session_entry = _pubsub_sessions.find(client_id);
+
+    if (session_entry == _pubsub_sessions.end()) {
+        return std::unexpected("Pub/Sub session is not registered");
+    }
+
+    auto session = session_entry->second.lock();
+
+    if (!session) {
+        _pubsub_sessions.erase(session_entry);
+        return std::unexpected("Pub/Sub session is no longer available");
+    }
+
+    auto frame = std::make_shared<const PubSubFrame>(PubSubFrame{
+        .payload = resp::serialize_response(std::move(response)),
+    });
+
+    return session->enqueue(std::move(frame));
 }
 
 std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_offset) {
@@ -1269,8 +1646,14 @@ void CommandProcessor::run(std::stop_token stop_token) {
             process_replica_acknowledgement(std::move(*acknowledgement_task));
         } else if (auto* rdb_task = std::get_if<LoadRdbTask>(&*task)) {
             process_rdb_load(std::move(*rdb_task));
+        } else if (auto* aof_task = std::get_if<InitializeAofTask>(&*task)) {
+            process_aof_initialization(std::move(*aof_task));
+        } else if (auto* registration_task =
+                       std::get_if<RegisterPubSubClientTask>(&*task)) {
+            process_pubsub_registration(std::move(*registration_task));
         } else {
-            process_aof_initialization(std::move(std::get<InitializeAofTask>(*task)));
+            process_pubsub_unregistration(
+                std::move(std::get<UnregisterPubSubClientTask>(*task)));
         }
 
         retry_pending_list_pops();

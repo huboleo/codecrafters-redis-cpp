@@ -80,6 +80,8 @@ void append_value(std::string& output, const resp::EmptyArray&) {
     output += "*0\r\n";
 }
 
+void append_value(std::string&, const resp::NoResponse&) {}
+
 void append_value(std::string& output, const resp::Array& array) {
     output += "*";
     output += std::to_string(array.values.size());
