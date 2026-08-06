@@ -34,7 +34,8 @@ constexpr std::string_view empty_rdb_payload{"REDIS0011\xff\0\0\0\0\0\0\0\0", 18
 
 TcpServer::TcpServer(ServerConfig config)
     : _config(std::move(config)),
-      _processor(_config.replica_of, _config.rdb_config, _config.aof_config) {}
+      _processor(_config.replica_of, _config.rdb_config, _config.aof_config,
+                 _config.default_user_password_hash) {}
 
 TcpServer::~TcpServer() {
     if (_replication_thread.joinable()) {
@@ -605,7 +606,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
     }
 
     std::shared_ptr<PubSubSession> session = std::move(*session_result);
-    _processor.register_pubsub_client(client_id, session).get();
+    _processor.register_client(client_id, session).get();
 
     std::string input_buffer;
     char receive_buffer[1024];
@@ -694,7 +695,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
                 parse_result.command.size() == 3 && parse_result.command.front() == "PSYNC";
 
             if (starts_replication) {
-                _processor.unregister_pubsub_client(client_id).get();
+                _processor.unregister_client(client_id).get();
                 auto registration = _processor.register_replica(client_id).get();
                 auto replication_result =
                     run_replica_connection(client_fd, std::move(registration));
@@ -742,7 +743,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
         }
     }
 
-    _processor.unregister_pubsub_client(client_id).get();
+    _processor.unregister_client(client_id).get();
     close(client_fd);
 }
 

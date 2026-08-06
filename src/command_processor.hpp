@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acl.hpp"
 #include "aof.hpp"
 #include "database.hpp"
 #include "pubsub.hpp"
@@ -28,7 +29,8 @@
 class CommandProcessor {
   public:
     explicit CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
-                              const RDBConfig& rdb_config, const AOFConfig& aof_config);
+                              const RDBConfig& rdb_config, const AOFConfig& aof_config,
+                              const std::optional<std::string>& default_user_password_hash);
     ~CommandProcessor();
 
     CommandProcessor(const CommandProcessor&) = delete;
@@ -56,13 +58,18 @@ class CommandProcessor {
     initialize_aof(aof::AppendOnlyFile file, std::vector<resp::Command> commands);
 
     [[nodiscard]] std::future<void>
-    register_pubsub_client(std::uint64_t client_id, std::shared_ptr<PubSubSession> session);
+    register_client(std::uint64_t client_id, std::shared_ptr<PubSubSession> pubsub_session);
 
-    [[nodiscard]] std::future<void> unregister_pubsub_client(std::uint64_t client_id);
+    [[nodiscard]] std::future<void> unregister_client(std::uint64_t client_id);
 
   private:
     enum class ReplicationRole { MASTER, REPLICA };
     enum class CommandSource { CLIENT, MASTER, AOF };
+
+    struct ClientState {
+        std::optional<std::string> authenticated_username;
+        std::weak_ptr<PubSubSession> pubsub_session;
+    };
 
     struct Task {
         std::uint64_t client_id;
@@ -128,21 +135,21 @@ class CommandProcessor {
         std::promise<std::expected<void, std::string>> completion;
     };
 
-    struct RegisterPubSubClientTask {
+    struct RegisterClientTask {
         std::uint64_t client_id;
-        std::shared_ptr<PubSubSession> session;
+        std::shared_ptr<PubSubSession> pubsub_session;
         std::promise<void> completion;
     };
 
-    struct UnregisterPubSubClientTask {
+    struct UnregisterClientTask {
         std::uint64_t client_id;
         std::promise<void> completion;
     };
 
     using ProcessorTask = std::variant<Task, RegisterReplicaTask, InstallReplicationStateTask,
                                        GetReplicationOffsetTask, AcknowledgeReplicaTask,
-                                       LoadRdbTask, InitializeAofTask, RegisterPubSubClientTask,
-                                       UnregisterPubSubClientTask>;
+                                       LoadRdbTask, InitializeAofTask, RegisterClientTask,
+                                       UnregisterClientTask>;
 
     struct ReplicationState {
         ReplicationRole role;
@@ -151,6 +158,8 @@ class CommandProcessor {
     };
 
     Database _database;
+
+    std::unordered_map<std::string, acl::User> _acl_users;
 
     RDBConfig _rdb_config;
 
@@ -181,8 +190,10 @@ class CommandProcessor {
     // from the time of WATCH execution
     std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>> _watched_keys;
 
-    // Pub/Sub state
-    std::unordered_map<std::uint64_t, std::weak_ptr<PubSubSession>> _pubsub_sessions;
+    // Per-connection state
+    std::unordered_map<std::uint64_t, ClientState> _clients;
+
+    // Pub/Sub subscriptions
     std::unordered_map<std::string, std::unordered_set<std::uint64_t>> _channel_subscribers;
     std::unordered_map<std::uint64_t, std::unordered_set<std::string>> _client_subscriptions;
 
@@ -211,9 +222,9 @@ class CommandProcessor {
 
     void process_aof_initialization(InitializeAofTask task);
 
-    void process_pubsub_registration(RegisterPubSubClientTask task);
+    void process_client_registration(RegisterClientTask task);
 
-    void process_pubsub_unregistration(UnregisterPubSubClientTask task);
+    void process_client_unregistration(UnregisterClientTask task);
 
     resp::Response subscribe(std::uint64_t client_id, const resp::Command& command);
 
@@ -223,6 +234,17 @@ class CommandProcessor {
 
     [[nodiscard]] std::expected<void, std::string>
     enqueue_pubsub_response(std::uint64_t client_id, resp::Response response);
+
+    resp::Response process_acl_command(std::uint64_t client_id,
+                                       const resp::Command& command);
+
+    resp::Response acl_whoami(std::uint64_t client_id, const resp::Command& command) const;
+
+    resp::Response acl_getuser(const resp::Command& command) const;
+
+    resp::Response acl_setuser(const resp::Command& command);
+
+    resp::Response authenticate(std::uint64_t client_id, const resp::Command& command);
 
     resp::Response process_command(std::uint64_t client_id, resp::Command& command,
                                    CommandSource source);

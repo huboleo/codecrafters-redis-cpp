@@ -4,6 +4,7 @@
 #include "rlist.hpp"
 #include "rstream.hpp"
 #include "server_config.hpp"
+#include "utils/sha256.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -263,11 +264,29 @@ std::string generate_replication_id() {
     return result;
 }
 
+acl::User make_default_acl_user(const std::optional<std::string>& password_hash) {
+    acl::User user{
+        .enabled = true,
+        .no_password = !password_hash.has_value(),
+        .all_commands = true,
+        .all_keys = true,
+        .all_channels = true,
+    };
+
+    if (password_hash) {
+        user.password_hashes.insert(*password_hash);
+    }
+
+    return user;
+}
+
 } // namespace
 
 CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
-                                   const RDBConfig& rdb_config, const AOFConfig& aof_config)
-    : _rdb_config(rdb_config), _aof_config(aof_config),
+                                   const RDBConfig& rdb_config, const AOFConfig& aof_config,
+                                   const std::optional<std::string>& default_user_password_hash)
+    : _acl_users{{"default", make_default_acl_user(default_user_password_hash)}},
+      _rdb_config(rdb_config), _aof_config(aof_config),
       _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
                                                                          : ReplicationRole::MASTER,
                                           .replication_id = generate_replication_id(),
@@ -427,11 +446,11 @@ CommandProcessor::initialize_aof(aof::AppendOnlyFile file,
 }
 
 std::future<void>
-CommandProcessor::register_pubsub_client(std::uint64_t client_id,
-                                         std::shared_ptr<PubSubSession> session) {
-    RegisterPubSubClientTask task{
+CommandProcessor::register_client(std::uint64_t client_id,
+                                  std::shared_ptr<PubSubSession> pubsub_session) {
+    RegisterClientTask task{
         .client_id = client_id,
-        .session = std::move(session),
+        .pubsub_session = std::move(pubsub_session),
         .completion = {},
     };
     std::future<void> future = task.completion.get_future();
@@ -445,8 +464,8 @@ CommandProcessor::register_pubsub_client(std::uint64_t client_id,
     return future;
 }
 
-std::future<void> CommandProcessor::unregister_pubsub_client(std::uint64_t client_id) {
-    UnregisterPubSubClientTask task{
+std::future<void> CommandProcessor::unregister_client(std::uint64_t client_id) {
+    UnregisterClientTask task{
         .client_id = client_id,
         .completion = {},
     };
@@ -493,6 +512,14 @@ resp::Response CommandProcessor::process_command(std::uint64_t client_id, resp::
 
     if (cmd_name == "PUBLISH") {
         return publish(command);
+    }
+
+    if (cmd_name == "AUTH") {
+        return authenticate(client_id, command);
+    }
+
+    if (cmd_name == "ACL") {
+        return process_acl_command(client_id, command);
     }
 
     if (cmd_name == "INFO") {
@@ -877,6 +904,47 @@ void CommandProcessor::process_xread(Task task) {
 }
 
 void CommandProcessor::process_task(Task task) {
+    const bool is_auth_command =
+        !task.command.empty() && task.command.front() == "AUTH";
+
+    if (task.source == CommandSource::CLIENT && !is_auth_command) {
+        auto client = _clients.find(task.client_id);
+        bool authenticated = client != _clients.end() &&
+                             client->second.authenticated_username.has_value();
+
+        if (authenticated) {
+            const auto user = _acl_users.find(*client->second.authenticated_username);
+            authenticated = user != _acl_users.end() && user->second.enabled;
+
+            if (!authenticated) {
+                client->second.authenticated_username.reset();
+            }
+        }
+
+        if (!authenticated) {
+            resp::Response response = resp::SimpleError{
+                .value = "NOAUTH Authentication required.",
+            };
+
+            if (_client_subscriptions.contains(task.client_id)) {
+                auto enqueue_result =
+                    enqueue_pubsub_response(task.client_id, std::move(response));
+
+                if (enqueue_result) {
+                    response = resp::NoResponse{};
+                } else {
+                    response = resp::SimpleError{
+                        .value = "ERR failed to queue Pub/Sub response: " +
+                                 enqueue_result.error(),
+                    };
+                }
+            }
+
+            task.response.set_value(std::move(response));
+            return;
+        }
+    }
+
     const bool client_is_subscribed =
         task.source == CommandSource::CLIENT && _client_subscriptions.contains(task.client_id);
     const bool command_is_allowed_while_subscribed =
@@ -1079,12 +1147,24 @@ void CommandProcessor::process_aof_initialization(InitializeAofTask task) {
     task.completion.set_value(std::expected<void, std::string>{});
 }
 
-void CommandProcessor::process_pubsub_registration(RegisterPubSubClientTask task) {
-    _pubsub_sessions.insert_or_assign(task.client_id, std::move(task.session));
+void CommandProcessor::process_client_registration(RegisterClientTask task) {
+    std::optional<std::string> authenticated_username;
+    const auto default_user = _acl_users.find("default");
+
+    if (default_user != _acl_users.end() && default_user->second.enabled &&
+        default_user->second.no_password) {
+        authenticated_username = "default";
+    }
+
+    _clients.insert_or_assign(task.client_id,
+                              ClientState{
+                                  .authenticated_username = std::move(authenticated_username),
+                                  .pubsub_session = std::move(task.pubsub_session),
+                              });
     task.completion.set_value();
 }
 
-void CommandProcessor::process_pubsub_unregistration(UnregisterPubSubClientTask task) {
+void CommandProcessor::process_client_unregistration(UnregisterClientTask task) {
     auto subscriptions = _client_subscriptions.find(task.client_id);
 
     if (subscriptions != _client_subscriptions.end()) {
@@ -1105,7 +1185,7 @@ void CommandProcessor::process_pubsub_unregistration(UnregisterPubSubClientTask 
         _client_subscriptions.erase(subscriptions);
     }
 
-    _pubsub_sessions.erase(task.client_id);
+    _clients.erase(task.client_id);
     task.completion.set_value();
 }
 
@@ -1117,18 +1197,18 @@ resp::Response CommandProcessor::subscribe(std::uint64_t client_id,
         };
     }
 
-    const auto session_entry = _pubsub_sessions.find(client_id);
+    const auto client = _clients.find(client_id);
 
-    if (session_entry == _pubsub_sessions.end()) {
+    if (client == _clients.end()) {
         return resp::SimpleError{
             .value = "ERR Pub/Sub session is not registered",
         };
     }
 
-    auto session = session_entry->second.lock();
+    auto session = client->second.pubsub_session.lock();
 
     if (!session) {
-        _pubsub_sessions.erase(session_entry);
+        _clients.erase(client);
         return resp::SimpleError{
             .value = "ERR Pub/Sub session is no longer available",
         };
@@ -1168,18 +1248,18 @@ resp::Response CommandProcessor::subscribe(std::uint64_t client_id,
 
 resp::Response CommandProcessor::unsubscribe(std::uint64_t client_id,
                                              const resp::Command& command) {
-    const auto session_entry = _pubsub_sessions.find(client_id);
+    const auto client = _clients.find(client_id);
 
-    if (session_entry == _pubsub_sessions.end()) {
+    if (client == _clients.end()) {
         return resp::SimpleError{
             .value = "ERR Pub/Sub session is not registered",
         };
     }
 
-    auto session = session_entry->second.lock();
+    auto session = client->second.pubsub_session.lock();
 
     if (!session) {
-        _pubsub_sessions.erase(session_entry);
+        _clients.erase(client);
         return resp::SimpleError{
             .value = "ERR Pub/Sub session is no longer available",
         };
@@ -1295,11 +1375,11 @@ resp::Response CommandProcessor::publish(const resp::Command& command) {
 
     while (subscriber != subscribers->second.end()) {
         const std::uint64_t client_id = *subscriber;
-        const auto session_entry = _pubsub_sessions.find(client_id);
+        const auto client = _clients.find(client_id);
         std::shared_ptr<PubSubSession> session;
 
-        if (session_entry != _pubsub_sessions.end()) {
-            session = session_entry->second.lock();
+        if (client != _clients.end()) {
+            session = client->second.pubsub_session.lock();
         }
 
         if (!session) {
@@ -1312,7 +1392,7 @@ resp::Response CommandProcessor::publish(const resp::Command& command) {
                 }
             }
 
-            _pubsub_sessions.erase(client_id);
+            _clients.erase(client_id);
             subscriber = subscribers->second.erase(subscriber);
             continue;
         }
@@ -1333,16 +1413,16 @@ resp::Response CommandProcessor::publish(const resp::Command& command) {
 
 std::expected<void, std::string>
 CommandProcessor::enqueue_pubsub_response(std::uint64_t client_id, resp::Response response) {
-    const auto session_entry = _pubsub_sessions.find(client_id);
+    const auto client = _clients.find(client_id);
 
-    if (session_entry == _pubsub_sessions.end()) {
+    if (client == _clients.end()) {
         return std::unexpected("Pub/Sub session is not registered");
     }
 
-    auto session = session_entry->second.lock();
+    auto session = client->second.pubsub_session.lock();
 
     if (!session) {
-        _pubsub_sessions.erase(session_entry);
+        _clients.erase(client);
         return std::unexpected("Pub/Sub session is no longer available");
     }
 
@@ -1351,6 +1431,404 @@ CommandProcessor::enqueue_pubsub_response(std::uint64_t client_id, resp::Respons
     });
 
     return session->enqueue(std::move(frame));
+}
+
+resp::Response CommandProcessor::process_acl_command(std::uint64_t client_id,
+                                                     const resp::Command& command) {
+    if (command.size() < 2) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'acl' command",
+        };
+    }
+
+    if (command[1] == "WHOAMI") {
+        return acl_whoami(client_id, command);
+    }
+
+    if (command[1] == "GETUSER") {
+        return acl_getuser(command);
+    }
+
+    if (command[1] == "SETUSER") {
+        return acl_setuser(command);
+    }
+
+    return resp::SimpleError{
+        .value = "ERR unknown ACL subcommand",
+    };
+}
+
+resp::Response CommandProcessor::acl_whoami(std::uint64_t client_id,
+                                            const resp::Command& command) const {
+    if (command.size() != 2) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'acl|whoami' command",
+        };
+    }
+
+    const auto client = _clients.find(client_id);
+
+    if (client == _clients.end() || !client->second.authenticated_username) {
+        return resp::SimpleError{
+            .value = "NOAUTH Authentication required.",
+        };
+    }
+
+    return resp::BulkString{
+        .value = *client->second.authenticated_username,
+    };
+}
+
+resp::Response CommandProcessor::acl_getuser(const resp::Command& command) const {
+    if (command.size() != 3) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'acl|getuser' command",
+        };
+    }
+
+    const auto user_entry = _acl_users.find(command[2]);
+
+    if (user_entry == _acl_users.end()) {
+        return resp::NullArray{};
+    }
+
+    const auto& user = user_entry->second;
+
+    std::vector<std::string> flags;
+    flags.push_back(user.enabled ? "on" : "off");
+
+    if (user.all_keys) {
+        flags.emplace_back("allkeys");
+    }
+
+    if (user.all_channels) {
+        flags.emplace_back("allchannels");
+    }
+
+    if (user.all_commands) {
+        flags.emplace_back("allcommands");
+    }
+
+    if (user.no_password) {
+        flags.emplace_back("nopass");
+    }
+
+    std::vector<std::string> passwords{user.password_hashes.begin(), user.password_hashes.end()};
+    std::ranges::sort(passwords);
+
+    std::vector<std::string> allowed_commands{user.allowed_commands.begin(),
+                                              user.allowed_commands.end()};
+    std::vector<std::string> denied_commands{user.denied_commands.begin(),
+                                             user.denied_commands.end()};
+    std::ranges::sort(allowed_commands);
+    std::ranges::sort(denied_commands);
+
+    auto append_rule = [](std::string& rules, std::string_view prefix,
+                          const std::string& value) {
+        if (!rules.empty()) {
+            rules += ' ';
+        }
+
+        rules += prefix;
+        rules += value;
+    };
+
+    std::string command_rules = user.all_commands ? "+@all" : "-@all";
+
+    for (const auto& denied : denied_commands) {
+        append_rule(command_rules, "-", denied);
+    }
+
+    for (const auto& allowed : allowed_commands) {
+        append_rule(command_rules, "+", allowed);
+    }
+
+    std::vector<std::string> key_patterns = user.key_patterns;
+    std::ranges::sort(key_patterns);
+
+    std::string key_rules;
+
+    if (user.all_keys) {
+        key_rules = "~*";
+    } else {
+        for (const auto& pattern : key_patterns) {
+            append_rule(key_rules, "~", pattern);
+        }
+    }
+
+    std::vector<std::string> channel_patterns = user.channel_patterns;
+    std::ranges::sort(channel_patterns);
+
+    std::string channel_rules;
+
+    if (user.all_channels) {
+        channel_rules = "&*";
+    } else {
+        for (const auto& pattern : channel_patterns) {
+            append_rule(channel_rules, "&", pattern);
+        }
+    }
+
+    return resp::ResponseArray{
+        .values = {
+            resp::BulkString{.value = "flags"},
+            resp::Array{.values = std::move(flags)},
+            resp::BulkString{.value = "passwords"},
+            resp::Array{.values = std::move(passwords)},
+            resp::BulkString{.value = "commands"},
+            resp::BulkString{.value = std::move(command_rules)},
+            resp::BulkString{.value = "keys"},
+            resp::BulkString{.value = std::move(key_rules)},
+            resp::BulkString{.value = "channels"},
+            resp::BulkString{.value = std::move(channel_rules)},
+            resp::BulkString{.value = "selectors"},
+            resp::EmptyArray{},
+        },
+    };
+}
+
+resp::Response CommandProcessor::acl_setuser(const resp::Command& command) {
+    if (command.size() < 3) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'acl|setuser' command",
+        };
+    }
+
+    const auto existing_user = _acl_users.find(command[2]);
+    acl::User updated_user;
+
+    if (existing_user != _acl_users.end()) {
+        updated_user = existing_user->second;
+    }
+
+    auto normalize_command_name = [](std::string_view name) {
+        std::string normalized{name};
+
+        for (char& character : normalized) {
+            if (character >= 'a' && character <= 'z') {
+                character = static_cast<char>(character - 'a' + 'A');
+            }
+        }
+
+        return normalized;
+    };
+
+    auto add_pattern = [](std::vector<std::string>& patterns, std::string_view pattern) {
+        if (std::ranges::find(patterns, pattern) == patterns.end()) {
+            patterns.emplace_back(pattern);
+        }
+    };
+
+    auto normalize_password_hash = [](std::string_view hash) -> std::optional<std::string> {
+        if (hash.size() != 64) {
+            return std::nullopt;
+        }
+
+        std::string normalized;
+        normalized.reserve(hash.size());
+
+        for (const char character : hash) {
+            if ((character >= '0' && character <= '9') ||
+                (character >= 'a' && character <= 'f')) {
+                normalized.push_back(character);
+            } else if (character >= 'A' && character <= 'F') {
+                normalized.push_back(static_cast<char>(character - 'A' + 'a'));
+            } else {
+                return std::nullopt;
+            }
+        }
+
+        return normalized;
+    };
+
+    for (std::size_t i = 3; i < command.size(); ++i) {
+        const auto& rule = command[i];
+
+        if (rule == "on") {
+            updated_user.enabled = true;
+        } else if (rule == "off") {
+            updated_user.enabled = false;
+        } else if (rule == "nopass") {
+            updated_user.no_password = true;
+            updated_user.password_hashes.clear();
+        } else if (rule == "resetpass") {
+            updated_user.no_password = false;
+            updated_user.password_hashes.clear();
+        } else if (rule == "allcommands") {
+            updated_user.all_commands = true;
+            updated_user.allowed_commands.clear();
+            updated_user.denied_commands.clear();
+        } else if (rule == "+@all") {
+            updated_user.all_commands = true;
+            updated_user.allowed_commands.clear();
+            updated_user.denied_commands.clear();
+        } else if (rule == "nocommands") {
+            updated_user.all_commands = false;
+            updated_user.allowed_commands.clear();
+            updated_user.denied_commands.clear();
+        } else if (rule == "-@all") {
+            updated_user.all_commands = false;
+            updated_user.allowed_commands.clear();
+            updated_user.denied_commands.clear();
+        } else if (rule == "allkeys") {
+            updated_user.all_keys = true;
+            updated_user.key_patterns.clear();
+        } else if (rule == "resetkeys") {
+            updated_user.all_keys = false;
+            updated_user.key_patterns.clear();
+        } else if (rule == "allchannels") {
+            updated_user.all_channels = true;
+            updated_user.channel_patterns.clear();
+        } else if (rule == "resetchannels") {
+            updated_user.all_channels = false;
+            updated_user.channel_patterns.clear();
+        } else if (rule == "reset") {
+            updated_user = acl::User{};
+        } else if (rule.size() > 1 && rule.front() == '>') {
+            auto password_hash =
+                crypto_utils::sha256(std::string_view{rule}.substr(1));
+
+            if (!password_hash) {
+                return resp::SimpleError{
+                    .value = "ERR failed to hash ACL password: " + password_hash.error(),
+                };
+            }
+
+            updated_user.no_password = false;
+            updated_user.password_hashes.insert(std::move(*password_hash));
+        } else if (rule.size() > 1 && rule.front() == '<') {
+            auto password_hash =
+                crypto_utils::sha256(std::string_view{rule}.substr(1));
+
+            if (!password_hash) {
+                return resp::SimpleError{
+                    .value = "ERR failed to hash ACL password: " + password_hash.error(),
+                };
+            }
+
+            updated_user.password_hashes.erase(*password_hash);
+        } else if (rule.size() > 1 && rule.front() == '#') {
+            auto password_hash = normalize_password_hash(std::string_view{rule}.substr(1));
+
+            if (!password_hash) {
+                return resp::SimpleError{
+                    .value = "ERR ACL password hash must contain exactly 64 hexadecimal characters",
+                };
+            }
+
+            updated_user.no_password = false;
+            updated_user.password_hashes.insert(std::move(*password_hash));
+        } else if (rule.size() > 1 && rule.front() == '!') {
+            auto password_hash = normalize_password_hash(std::string_view{rule}.substr(1));
+
+            if (!password_hash) {
+                return resp::SimpleError{
+                    .value = "ERR ACL password hash must contain exactly 64 hexadecimal characters",
+                };
+            }
+
+            updated_user.password_hashes.erase(*password_hash);
+        } else if (rule.size() > 1 && rule.front() == '+' && rule[1] != '@') {
+            std::string command_name = normalize_command_name(
+                std::string_view{rule}.substr(1));
+
+            updated_user.denied_commands.erase(command_name);
+
+            if (updated_user.all_commands) {
+                updated_user.allowed_commands.erase(command_name);
+            } else {
+                updated_user.allowed_commands.insert(std::move(command_name));
+            }
+        } else if (rule.size() > 1 && rule.front() == '-' && rule[1] != '@') {
+            std::string command_name = normalize_command_name(
+                std::string_view{rule}.substr(1));
+
+            updated_user.allowed_commands.erase(command_name);
+
+            if (updated_user.all_commands) {
+                updated_user.denied_commands.insert(std::move(command_name));
+            } else {
+                updated_user.denied_commands.erase(command_name);
+            }
+        } else if (rule.size() > 1 && rule.front() == '~') {
+            const std::string_view pattern{rule.data() + 1, rule.size() - 1};
+
+            if (pattern == "*") {
+                updated_user.all_keys = true;
+                updated_user.key_patterns.clear();
+            } else if (!updated_user.all_keys) {
+                add_pattern(updated_user.key_patterns, pattern);
+            }
+        } else if (rule.size() > 1 && rule.front() == '&') {
+            const std::string_view pattern{rule.data() + 1, rule.size() - 1};
+
+            if (pattern == "*") {
+                updated_user.all_channels = true;
+                updated_user.channel_patterns.clear();
+            } else if (!updated_user.all_channels) {
+                add_pattern(updated_user.channel_patterns, pattern);
+            }
+        } else {
+            return resp::SimpleError{
+                .value = "ERR unsupported ACL rule: " + rule,
+            };
+        }
+    }
+
+    _acl_users.insert_or_assign(command[2], std::move(updated_user));
+    return resp::SimpleString{.value = "OK"};
+}
+
+resp::Response CommandProcessor::authenticate(std::uint64_t client_id,
+                                              const resp::Command& command) {
+    if (command.size() != 2 && command.size() != 3) {
+        return resp::SimpleError{
+            .value = "ERR wrong number of arguments for 'auth' command",
+        };
+    }
+
+    const std::string_view username = command.size() == 2 ? "default" : command[1];
+    const std::string_view password = command.size() == 2 ? command[1] : command[2];
+
+    const auto client = _clients.find(client_id);
+
+    if (client == _clients.end()) {
+        return resp::SimpleError{
+            .value = "ERR client connection is not registered",
+        };
+    }
+
+    const auto user = _acl_users.find(std::string{username});
+
+    if (user == _acl_users.end() || !user->second.enabled) {
+        return resp::SimpleError{
+            .value = "WRONGPASS invalid username-password pair or user is disabled.",
+        };
+    }
+
+    bool credentials_match = user->second.no_password;
+
+    if (!credentials_match) {
+        auto password_hash = crypto_utils::sha256(password);
+
+        if (!password_hash) {
+            return resp::SimpleError{
+                .value = "ERR failed to hash authentication password: " +
+                         password_hash.error(),
+            };
+        }
+
+        credentials_match = user->second.password_hashes.contains(*password_hash);
+    }
+
+    if (!credentials_match) {
+        return resp::SimpleError{
+            .value = "WRONGPASS invalid username-password pair or user is disabled.",
+        };
+    }
+
+    client->second.authenticated_username = std::string{username};
+    return resp::SimpleString{.value = "OK"};
 }
 
 std::size_t CommandProcessor::count_acknowledged_replicas(std::uint64_t target_offset) {
@@ -1648,12 +2126,10 @@ void CommandProcessor::run(std::stop_token stop_token) {
             process_rdb_load(std::move(*rdb_task));
         } else if (auto* aof_task = std::get_if<InitializeAofTask>(&*task)) {
             process_aof_initialization(std::move(*aof_task));
-        } else if (auto* registration_task =
-                       std::get_if<RegisterPubSubClientTask>(&*task)) {
-            process_pubsub_registration(std::move(*registration_task));
+        } else if (auto* registration_task = std::get_if<RegisterClientTask>(&*task)) {
+            process_client_registration(std::move(*registration_task));
         } else {
-            process_pubsub_unregistration(
-                std::move(std::get<UnregisterPubSubClientTask>(*task)));
+            process_client_unregistration(std::move(std::get<UnregisterClientTask>(*task)));
         }
 
         retry_pending_list_pops();

@@ -1,4 +1,5 @@
 #include "server_config.hpp"
+#include "utils/sha256.hpp"
 #include <charconv>
 #include <cstdint>
 #include <expected>
@@ -141,6 +142,22 @@ std::expected<ServerConfig, std::string> parse_arguments(int argc, char** argv) 
             }
 
             config.replica_of = std::move(*replica);
+            continue;
+        }
+
+        if (arg == "--requirepass") {
+            if (i + 1 >= argc) {
+                return std::unexpected("Missing value after --requirepass");
+            }
+
+            const std::string_view password{argv[++i]};
+            auto password_hash = crypto_utils::sha256(password);
+
+            if (!password_hash) {
+                return std::unexpected(password_hash.error());
+            }
+
+            config.default_user_password_hash = std::move(*password_hash);
             continue;
         }
 

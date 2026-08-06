@@ -24,6 +24,7 @@ struct AOFConfig {
 struct ServerConfig {
     std::uint16_t port{6379};
     std::optional<ReplicaConfig> replica_of;
+    std::optional<std::string> default_user_password_hash;
     RDBConfig rdb_config;
     AOFConfig aof_config;
 };
