@@ -15,6 +15,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <netdb.h>
 #include <poll.h>
 #include <print>
@@ -30,6 +31,7 @@
 
 namespace {
 constexpr std::string_view empty_rdb_payload{"REDIS0011\xff\0\0\0\0\0\0\0\0", 18};
+constexpr int connection_reap_interval_ms = 500;
 }
 
 TcpServer::TcpServer(ServerConfig config)
@@ -38,23 +40,130 @@ TcpServer::TcpServer(ServerConfig config)
                  _config.default_user_password_hash) {}
 
 TcpServer::~TcpServer() {
+    stop();
+
+    if (_server_fd >= 0) {
+        close(_server_fd);
+        _server_fd = -1;
+    }
+
+    if (_master_fd && *_master_fd >= 0) {
+        close(*_master_fd);
+        _master_fd.reset();
+    }
+}
+
+void TcpServer::stop() {
+    std::lock_guard stop_lock(_stop_mutex);
+
+    if (_stopping.exchange(true)) {
+        return;
+    }
+
+    if (_server_fd >= 0) {
+        shutdown(_server_fd, SHUT_RDWR);
+    }
+
     if (_replication_thread.joinable()) {
         _replication_thread.request_stop();
 
         if (_master_fd) {
             shutdown(*_master_fd, SHUT_RDWR);
         }
+    }
 
+    stop_connection_workers();
+
+    if (_replication_thread.joinable()) {
         _replication_thread.join();
     }
+}
 
-    if (_server_fd >= 0) {
-        close(_server_fd);
+void TcpServer::start_connection(int socket_fd, std::uint64_t client_id) {
+    std::lock_guard lock(_connections_mutex);
+
+    if (_stopping.load()) {
+        close(socket_fd);
+        return;
     }
 
-    if (_master_fd && *_master_fd >= 0) {
-        close(*_master_fd);
+    auto state = std::make_shared<ConnectionState>(client_id, socket_fd);
+    std::jthread thread([this, state](std::stop_token stop_token) {
+        handle_connection(state->socket_fd.load(), state->client_id, stop_token);
+
+        const int owned_socket = state->socket_fd.exchange(-1);
+
+        if (owned_socket >= 0) {
+            close(owned_socket);
+        }
+
+        state->finished.store(true, std::memory_order_release);
+    });
+
+    _connection_workers.push_back(ConnectionWorker{
+        .state = std::move(state),
+        .thread = std::move(thread),
+    });
+}
+
+void TcpServer::reap_completed_connections() {
+    std::lock_guard lock(_connections_mutex);
+
+    std::erase_if(_connection_workers, [](ConnectionWorker& worker) {
+        if (!worker.state->finished.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        if (worker.thread.joinable()) {
+            worker.thread.join();
+        }
+
+        return true;
+    });
+}
+
+void TcpServer::stop_connection_workers() {
+    std::vector<std::uint64_t> active_client_ids;
+
+    {
+        std::lock_guard lock(_connections_mutex);
+        active_client_ids.reserve(_connection_workers.size());
+
+        for (auto& worker : _connection_workers) {
+            worker.thread.request_stop();
+
+            const int socket_fd = worker.state->socket_fd.load();
+
+            if (socket_fd >= 0) {
+                shutdown(socket_fd, SHUT_RDWR);
+            }
+
+            if (!worker.state->finished.load(std::memory_order_acquire)) {
+                active_client_ids.push_back(worker.state->client_id);
+            }
+        }
     }
+
+    std::vector<std::future<void>> cancellation_results;
+    cancellation_results.reserve(active_client_ids.size());
+
+    for (const std::uint64_t client_id : active_client_ids) {
+        cancellation_results.push_back(_processor.unregister_client(client_id));
+    }
+
+    for (auto& result : cancellation_results) {
+        result.get();
+    }
+
+    std::lock_guard lock(_connections_mutex);
+
+    for (auto& worker : _connection_workers) {
+        if (worker.thread.joinable()) {
+            worker.thread.join();
+        }
+    }
+
+    _connection_workers.clear();
 }
 
 std::expected<int, std::string> TcpServer::connect_to_master(const ReplicaConfig& config) {
@@ -109,6 +218,7 @@ std::expected<void, std::string> TcpServer::setup_server() {
     int reuse = 1;
     if (setsockopt(_server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         close(_server_fd);
+        _server_fd = -1;
         return std::unexpected("setsockopt failed");
     }
 
@@ -119,12 +229,14 @@ std::expected<void, std::string> TcpServer::setup_server() {
 
     if (bind(_server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
         close(_server_fd);
+        _server_fd = -1;
         return std::unexpected("Failed to bind to port 6379");
     }
 
     int connection_backlog = 5;
     if (listen(_server_fd, connection_backlog) != 0) {
         close(_server_fd);
+        _server_fd = -1;
         return std::unexpected("listen failed");
     }
 
@@ -596,17 +708,22 @@ std::expected<void, std::string> TcpServer::consume_replication_stream(std::stop
     return {};
 }
 
-void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
+void TcpServer::handle_connection(int client_fd, std::uint64_t client_id,
+                                  std::stop_token stop_token) {
     auto session_result = PubSubSession::create();
 
     if (!session_result) {
         std::println(stderr, "Failed to initialize Pub/Sub session: {}", session_result.error());
-        close(client_fd);
         return;
     }
 
     std::shared_ptr<PubSubSession> session = std::move(*session_result);
     _processor.register_client(client_id, session).get();
+
+    if (stop_token.stop_requested()) {
+        _processor.unregister_client(client_id).get();
+        return;
+    }
 
     std::string input_buffer;
     char receive_buffer[1024];
@@ -636,7 +753,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
         return {};
     };
 
-    while (connection_open) {
+    while (connection_open && !stop_token.stop_requested()) {
         const int poll_result =
             poll(descriptors.data(), static_cast<nfds_t>(descriptors.size()), -1);
 
@@ -677,7 +794,7 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
 
         input_buffer.append(receive_buffer, static_cast<std::size_t>(bytes_read));
 
-        while (!input_buffer.empty()) {
+        while (!input_buffer.empty() && !stop_token.stop_requested()) {
             auto outcome = resp::parse_command(input_buffer);
 
             if (std::holds_alternative<resp::Incomplete>(outcome)) {
@@ -705,13 +822,18 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
                                  replication_result.error());
                 }
 
-                close(client_fd);
+                _processor.unregister_client(client_id).get();
                 return;
             }
 
             auto future_result = _processor.submit(client_id, std::move(parse_result.command));
 
             auto result = future_result.get();
+
+            if (stop_token.stop_requested()) {
+                connection_open = false;
+                break;
+            }
 
             const bool response_is_queued =
                 std::holds_alternative<resp::NoResponse>(
@@ -744,11 +866,45 @@ void TcpServer::handle_connection(int client_fd, std::uint64_t client_id) {
     }
 
     _processor.unregister_client(client_id).get();
-    close(client_fd);
 }
 
 void TcpServer::run_connection_loop() {
-    while (true) {
+    pollfd server_descriptor{
+        .fd = _server_fd,
+        .events = POLLIN,
+        .revents = 0,
+    };
+
+    while (!_stopping.load()) {
+        reap_completed_connections();
+        server_descriptor.revents = 0;
+
+        const int poll_result = poll(&server_descriptor, 1, connection_reap_interval_ms);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (!_stopping.load()) {
+                std::println(stderr, "Failed to poll server socket: {}", std::strerror(errno));
+            }
+
+            break;
+        }
+
+        if (poll_result == 0) {
+            continue;
+        }
+
+        if ((server_descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            break;
+        }
+
+        if ((server_descriptor.revents & POLLIN) == 0) {
+            continue;
+        }
+
         struct sockaddr_in client_addr;
         int client_addr_len = sizeof(client_addr);
 
@@ -756,12 +912,20 @@ void TcpServer::run_connection_loop() {
             accept(_server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addr_len);
 
         if (client_socket_fd < 0) {
-            continue;
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (!_stopping.load()) {
+                std::println(stderr, "Failed to accept connection: {}", std::strerror(errno));
+            }
+
+            break;
         }
 
         const std::uint64_t client_id = _next_client_id++;
 
-        std::thread(&TcpServer::handle_connection, this, client_socket_fd, client_id).detach();
+        start_connection(client_socket_fd, client_id);
     }
 }
 
@@ -822,4 +986,5 @@ void TcpServer::run() {
     }
 
     run_connection_loop();
+    stop();
 }

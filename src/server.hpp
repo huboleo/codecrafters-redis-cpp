@@ -2,14 +2,17 @@
 #include "command_processor.hpp"
 #include "resp.hpp"
 #include "server_config.hpp"
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 class TcpServer {
   public:
@@ -22,11 +25,26 @@ class TcpServer {
     std::expected<void, std::string> setup_replication();
     std::expected<void, std::string> initialize_persistence();
     void run();
+    void stop();
 
   private:
     struct FullResync {
         std::string replication_id;
         std::uint64_t offset;
+    };
+
+    struct ConnectionState {
+        ConnectionState(std::uint64_t client_id, int socket_fd)
+            : client_id(client_id), socket_fd(socket_fd) {}
+
+        std::uint64_t client_id;
+        std::atomic<int> socket_fd;
+        std::atomic_bool finished{false};
+    };
+
+    struct ConnectionWorker {
+        std::shared_ptr<ConnectionState> state;
+        std::jthread thread;
     };
 
     ServerConfig _config;
@@ -36,8 +54,18 @@ class TcpServer {
     std::optional<int> _master_fd;
     std::string _master_input_buffer;
     std::jthread _replication_thread;
+    std::atomic_bool _stopping{false};
+    std::mutex _stop_mutex;
+    std::mutex _connections_mutex;
+    std::vector<ConnectionWorker> _connection_workers;
 
     void run_connection_loop();
+
+    void start_connection(int socket_fd, std::uint64_t client_id);
+
+    void reap_completed_connections();
+
+    void stop_connection_workers();
 
     void replication_loop(std::stop_token stop_token);
 
@@ -77,5 +105,6 @@ class TcpServer {
     send_command_and_expect(int socket_fd, const resp::Command& command,
                             std::string_view expected_response);
 
-    void handle_connection(int client_fd, std::uint64_t client_id);
+    void handle_connection(int client_fd, std::uint64_t client_id,
+                           std::stop_token stop_token);
 };

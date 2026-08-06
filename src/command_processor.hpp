@@ -67,7 +67,7 @@ class CommandProcessor {
     enum class CommandSource { CLIENT, MASTER, AOF };
 
     struct ClientState {
-        std::optional<std::string> authenticated_username;
+        bool authenticated;
         std::weak_ptr<PubSubSession> pubsub_session;
     };
 
@@ -159,7 +159,7 @@ class CommandProcessor {
 
     Database _database;
 
-    std::unordered_map<std::string, acl::User> _acl_users;
+    acl::User _default_user;
 
     RDBConfig _rdb_config;
 
@@ -225,6 +225,8 @@ class CommandProcessor {
     void process_client_registration(RegisterClientTask task);
 
     void process_client_unregistration(UnregisterClientTask task);
+
+    void cancel_pending_commands(std::uint64_t client_id);
 
     resp::Response subscribe(std::uint64_t client_id, const resp::Command& command);
 

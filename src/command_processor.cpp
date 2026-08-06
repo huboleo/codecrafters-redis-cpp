@@ -266,11 +266,7 @@ std::string generate_replication_id() {
 
 acl::User make_default_acl_user(const std::optional<std::string>& password_hash) {
     acl::User user{
-        .enabled = true,
         .no_password = !password_hash.has_value(),
-        .all_commands = true,
-        .all_keys = true,
-        .all_channels = true,
     };
 
     if (password_hash) {
@@ -285,7 +281,7 @@ acl::User make_default_acl_user(const std::optional<std::string>& password_hash)
 CommandProcessor::CommandProcessor(const std::optional<ReplicaConfig>& replica_of,
                                    const RDBConfig& rdb_config, const AOFConfig& aof_config,
                                    const std::optional<std::string>& default_user_password_hash)
-    : _acl_users{{"default", make_default_acl_user(default_user_password_hash)}},
+    : _default_user(make_default_acl_user(default_user_password_hash)),
       _rdb_config(rdb_config), _aof_config(aof_config),
       _replication_state(ReplicationState{.role = replica_of.has_value() ? ReplicationRole::REPLICA
                                                                          : ReplicationRole::MASTER,
@@ -909,17 +905,7 @@ void CommandProcessor::process_task(Task task) {
 
     if (task.source == CommandSource::CLIENT && !is_auth_command) {
         auto client = _clients.find(task.client_id);
-        bool authenticated = client != _clients.end() &&
-                             client->second.authenticated_username.has_value();
-
-        if (authenticated) {
-            const auto user = _acl_users.find(*client->second.authenticated_username);
-            authenticated = user != _acl_users.end() && user->second.enabled;
-
-            if (!authenticated) {
-                client->second.authenticated_username.reset();
-            }
-        }
+        const bool authenticated = client != _clients.end() && client->second.authenticated;
 
         if (!authenticated) {
             resp::Response response = resp::SimpleError{
@@ -1148,23 +1134,37 @@ void CommandProcessor::process_aof_initialization(InitializeAofTask task) {
 }
 
 void CommandProcessor::process_client_registration(RegisterClientTask task) {
-    std::optional<std::string> authenticated_username;
-    const auto default_user = _acl_users.find("default");
-
-    if (default_user != _acl_users.end() && default_user->second.enabled &&
-        default_user->second.no_password) {
-        authenticated_username = "default";
-    }
-
     _clients.insert_or_assign(task.client_id,
                               ClientState{
-                                  .authenticated_username = std::move(authenticated_username),
+                                  .authenticated = _default_user.no_password,
                                   .pubsub_session = std::move(task.pubsub_session),
                               });
     task.completion.set_value();
 }
 
+void CommandProcessor::cancel_pending_commands(std::uint64_t client_id) {
+    auto cancel = [client_id](auto& pending_commands) {
+        auto pending = pending_commands.begin();
+
+        while (pending != pending_commands.end()) {
+            if (pending->task.client_id != client_id) {
+                ++pending;
+                continue;
+            }
+
+            pending->task.response.set_value(resp::NoResponse{});
+            pending = pending_commands.erase(pending);
+        }
+    };
+
+    cancel(_pending_list_pops);
+    cancel(_pending_stream_reads);
+    cancel(_pending_waits);
+}
+
 void CommandProcessor::process_client_unregistration(UnregisterClientTask task) {
+    cancel_pending_commands(task.client_id);
+
     auto subscriptions = _client_subscriptions.find(task.client_id);
 
     if (subscriptions != _client_subscriptions.end()) {
@@ -1186,6 +1186,10 @@ void CommandProcessor::process_client_unregistration(UnregisterClientTask task) 
     }
 
     _clients.erase(task.client_id);
+    _transactions.erase(task.client_id);
+    _watched_keys.erase(task.client_id);
+    _client_write_offsets.erase(task.client_id);
+    _replica_acknowledged_offsets.erase(task.client_id);
     task.completion.set_value();
 }
 
@@ -1468,14 +1472,14 @@ resp::Response CommandProcessor::acl_whoami(std::uint64_t client_id,
 
     const auto client = _clients.find(client_id);
 
-    if (client == _clients.end() || !client->second.authenticated_username) {
+    if (client == _clients.end() || !client->second.authenticated) {
         return resp::SimpleError{
             .value = "NOAUTH Authentication required.",
         };
     }
 
     return resp::BulkString{
-        .value = *client->second.authenticated_username,
+        .value = "default",
     };
 }
 
@@ -1486,88 +1490,24 @@ resp::Response CommandProcessor::acl_getuser(const resp::Command& command) const
         };
     }
 
-    const auto user_entry = _acl_users.find(command[2]);
-
-    if (user_entry == _acl_users.end()) {
+    if (command[2] != "default") {
         return resp::NullArray{};
     }
 
-    const auto& user = user_entry->second;
+    std::vector<std::string> flags{
+        "on",
+        "allkeys",
+        "allchannels",
+        "allcommands",
+    };
 
-    std::vector<std::string> flags;
-    flags.push_back(user.enabled ? "on" : "off");
-
-    if (user.all_keys) {
-        flags.emplace_back("allkeys");
-    }
-
-    if (user.all_channels) {
-        flags.emplace_back("allchannels");
-    }
-
-    if (user.all_commands) {
-        flags.emplace_back("allcommands");
-    }
-
-    if (user.no_password) {
+    if (_default_user.no_password) {
         flags.emplace_back("nopass");
     }
 
-    std::vector<std::string> passwords{user.password_hashes.begin(), user.password_hashes.end()};
+    std::vector<std::string> passwords{_default_user.password_hashes.begin(),
+                                       _default_user.password_hashes.end()};
     std::ranges::sort(passwords);
-
-    std::vector<std::string> allowed_commands{user.allowed_commands.begin(),
-                                              user.allowed_commands.end()};
-    std::vector<std::string> denied_commands{user.denied_commands.begin(),
-                                             user.denied_commands.end()};
-    std::ranges::sort(allowed_commands);
-    std::ranges::sort(denied_commands);
-
-    auto append_rule = [](std::string& rules, std::string_view prefix,
-                          const std::string& value) {
-        if (!rules.empty()) {
-            rules += ' ';
-        }
-
-        rules += prefix;
-        rules += value;
-    };
-
-    std::string command_rules = user.all_commands ? "+@all" : "-@all";
-
-    for (const auto& denied : denied_commands) {
-        append_rule(command_rules, "-", denied);
-    }
-
-    for (const auto& allowed : allowed_commands) {
-        append_rule(command_rules, "+", allowed);
-    }
-
-    std::vector<std::string> key_patterns = user.key_patterns;
-    std::ranges::sort(key_patterns);
-
-    std::string key_rules;
-
-    if (user.all_keys) {
-        key_rules = "~*";
-    } else {
-        for (const auto& pattern : key_patterns) {
-            append_rule(key_rules, "~", pattern);
-        }
-    }
-
-    std::vector<std::string> channel_patterns = user.channel_patterns;
-    std::ranges::sort(channel_patterns);
-
-    std::string channel_rules;
-
-    if (user.all_channels) {
-        channel_rules = "&*";
-    } else {
-        for (const auto& pattern : channel_patterns) {
-            append_rule(channel_rules, "&", pattern);
-        }
-    }
 
     return resp::ResponseArray{
         .values = {
@@ -1576,11 +1516,11 @@ resp::Response CommandProcessor::acl_getuser(const resp::Command& command) const
             resp::BulkString{.value = "passwords"},
             resp::Array{.values = std::move(passwords)},
             resp::BulkString{.value = "commands"},
-            resp::BulkString{.value = std::move(command_rules)},
+            resp::BulkString{.value = "+@all"},
             resp::BulkString{.value = "keys"},
-            resp::BulkString{.value = std::move(key_rules)},
+            resp::BulkString{.value = "~*"},
             resp::BulkString{.value = "channels"},
-            resp::BulkString{.value = std::move(channel_rules)},
+            resp::BulkString{.value = "&*"},
             resp::BulkString{.value = "selectors"},
             resp::EmptyArray{},
         },
@@ -1594,96 +1534,20 @@ resp::Response CommandProcessor::acl_setuser(const resp::Command& command) {
         };
     }
 
-    const auto existing_user = _acl_users.find(command[2]);
-    acl::User updated_user;
-
-    if (existing_user != _acl_users.end()) {
-        updated_user = existing_user->second;
+    if (command[2] != "default") {
+        return resp::SimpleError{
+            .value = "ERR only the default ACL user is supported",
+        };
     }
 
-    auto normalize_command_name = [](std::string_view name) {
-        std::string normalized{name};
-
-        for (char& character : normalized) {
-            if (character >= 'a' && character <= 'z') {
-                character = static_cast<char>(character - 'a' + 'A');
-            }
-        }
-
-        return normalized;
-    };
-
-    auto add_pattern = [](std::vector<std::string>& patterns, std::string_view pattern) {
-        if (std::ranges::find(patterns, pattern) == patterns.end()) {
-            patterns.emplace_back(pattern);
-        }
-    };
-
-    auto normalize_password_hash = [](std::string_view hash) -> std::optional<std::string> {
-        if (hash.size() != 64) {
-            return std::nullopt;
-        }
-
-        std::string normalized;
-        normalized.reserve(hash.size());
-
-        for (const char character : hash) {
-            if ((character >= '0' && character <= '9') ||
-                (character >= 'a' && character <= 'f')) {
-                normalized.push_back(character);
-            } else if (character >= 'A' && character <= 'F') {
-                normalized.push_back(static_cast<char>(character - 'A' + 'a'));
-            } else {
-                return std::nullopt;
-            }
-        }
-
-        return normalized;
-    };
+    acl::User updated_user = _default_user;
 
     for (std::size_t i = 3; i < command.size(); ++i) {
         const auto& rule = command[i];
 
-        if (rule == "on") {
-            updated_user.enabled = true;
-        } else if (rule == "off") {
-            updated_user.enabled = false;
-        } else if (rule == "nopass") {
+        if (rule == "nopass") {
             updated_user.no_password = true;
             updated_user.password_hashes.clear();
-        } else if (rule == "resetpass") {
-            updated_user.no_password = false;
-            updated_user.password_hashes.clear();
-        } else if (rule == "allcommands") {
-            updated_user.all_commands = true;
-            updated_user.allowed_commands.clear();
-            updated_user.denied_commands.clear();
-        } else if (rule == "+@all") {
-            updated_user.all_commands = true;
-            updated_user.allowed_commands.clear();
-            updated_user.denied_commands.clear();
-        } else if (rule == "nocommands") {
-            updated_user.all_commands = false;
-            updated_user.allowed_commands.clear();
-            updated_user.denied_commands.clear();
-        } else if (rule == "-@all") {
-            updated_user.all_commands = false;
-            updated_user.allowed_commands.clear();
-            updated_user.denied_commands.clear();
-        } else if (rule == "allkeys") {
-            updated_user.all_keys = true;
-            updated_user.key_patterns.clear();
-        } else if (rule == "resetkeys") {
-            updated_user.all_keys = false;
-            updated_user.key_patterns.clear();
-        } else if (rule == "allchannels") {
-            updated_user.all_channels = true;
-            updated_user.channel_patterns.clear();
-        } else if (rule == "resetchannels") {
-            updated_user.all_channels = false;
-            updated_user.channel_patterns.clear();
-        } else if (rule == "reset") {
-            updated_user = acl::User{};
         } else if (rule.size() > 1 && rule.front() == '>') {
             auto password_hash =
                 crypto_utils::sha256(std::string_view{rule}.substr(1));
@@ -1696,78 +1560,6 @@ resp::Response CommandProcessor::acl_setuser(const resp::Command& command) {
 
             updated_user.no_password = false;
             updated_user.password_hashes.insert(std::move(*password_hash));
-        } else if (rule.size() > 1 && rule.front() == '<') {
-            auto password_hash =
-                crypto_utils::sha256(std::string_view{rule}.substr(1));
-
-            if (!password_hash) {
-                return resp::SimpleError{
-                    .value = "ERR failed to hash ACL password: " + password_hash.error(),
-                };
-            }
-
-            updated_user.password_hashes.erase(*password_hash);
-        } else if (rule.size() > 1 && rule.front() == '#') {
-            auto password_hash = normalize_password_hash(std::string_view{rule}.substr(1));
-
-            if (!password_hash) {
-                return resp::SimpleError{
-                    .value = "ERR ACL password hash must contain exactly 64 hexadecimal characters",
-                };
-            }
-
-            updated_user.no_password = false;
-            updated_user.password_hashes.insert(std::move(*password_hash));
-        } else if (rule.size() > 1 && rule.front() == '!') {
-            auto password_hash = normalize_password_hash(std::string_view{rule}.substr(1));
-
-            if (!password_hash) {
-                return resp::SimpleError{
-                    .value = "ERR ACL password hash must contain exactly 64 hexadecimal characters",
-                };
-            }
-
-            updated_user.password_hashes.erase(*password_hash);
-        } else if (rule.size() > 1 && rule.front() == '+' && rule[1] != '@') {
-            std::string command_name = normalize_command_name(
-                std::string_view{rule}.substr(1));
-
-            updated_user.denied_commands.erase(command_name);
-
-            if (updated_user.all_commands) {
-                updated_user.allowed_commands.erase(command_name);
-            } else {
-                updated_user.allowed_commands.insert(std::move(command_name));
-            }
-        } else if (rule.size() > 1 && rule.front() == '-' && rule[1] != '@') {
-            std::string command_name = normalize_command_name(
-                std::string_view{rule}.substr(1));
-
-            updated_user.allowed_commands.erase(command_name);
-
-            if (updated_user.all_commands) {
-                updated_user.denied_commands.insert(std::move(command_name));
-            } else {
-                updated_user.denied_commands.erase(command_name);
-            }
-        } else if (rule.size() > 1 && rule.front() == '~') {
-            const std::string_view pattern{rule.data() + 1, rule.size() - 1};
-
-            if (pattern == "*") {
-                updated_user.all_keys = true;
-                updated_user.key_patterns.clear();
-            } else if (!updated_user.all_keys) {
-                add_pattern(updated_user.key_patterns, pattern);
-            }
-        } else if (rule.size() > 1 && rule.front() == '&') {
-            const std::string_view pattern{rule.data() + 1, rule.size() - 1};
-
-            if (pattern == "*") {
-                updated_user.all_channels = true;
-                updated_user.channel_patterns.clear();
-            } else if (!updated_user.all_channels) {
-                add_pattern(updated_user.channel_patterns, pattern);
-            }
         } else {
             return resp::SimpleError{
                 .value = "ERR unsupported ACL rule: " + rule,
@@ -1775,7 +1567,7 @@ resp::Response CommandProcessor::acl_setuser(const resp::Command& command) {
         }
     }
 
-    _acl_users.insert_or_assign(command[2], std::move(updated_user));
+    _default_user = std::move(updated_user);
     return resp::SimpleString{.value = "OK"};
 }
 
@@ -1798,15 +1590,13 @@ resp::Response CommandProcessor::authenticate(std::uint64_t client_id,
         };
     }
 
-    const auto user = _acl_users.find(std::string{username});
-
-    if (user == _acl_users.end() || !user->second.enabled) {
+    if (username != "default") {
         return resp::SimpleError{
             .value = "WRONGPASS invalid username-password pair or user is disabled.",
         };
     }
 
-    bool credentials_match = user->second.no_password;
+    bool credentials_match = _default_user.no_password;
 
     if (!credentials_match) {
         auto password_hash = crypto_utils::sha256(password);
@@ -1818,7 +1608,7 @@ resp::Response CommandProcessor::authenticate(std::uint64_t client_id,
             };
         }
 
-        credentials_match = user->second.password_hashes.contains(*password_hash);
+        credentials_match = _default_user.password_hashes.contains(*password_hash);
     }
 
     if (!credentials_match) {
@@ -1827,7 +1617,7 @@ resp::Response CommandProcessor::authenticate(std::uint64_t client_id,
         };
     }
 
-    client->second.authenticated_username = std::string{username};
+    client->second.authenticated = true;
     return resp::SimpleString{.value = "OK"};
 }
 
